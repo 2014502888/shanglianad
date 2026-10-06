@@ -353,7 +353,67 @@ static void slRunFlow(void) {
     });
 }
 
+#pragma mark - 出站请求记录（看 App 真实怎么带鉴权）
+
+@interface SLReqProtocol : NSURLProtocol
+@end
+
+static void slLogRequest(NSURLRequest *req, NSData *bodyData) {
+    if (!req.URL) return;
+    NSString *u = req.URL.absoluteString;
+    // 只记 API 类请求，过滤图片/统计
+    if ([u containsString:@"slaclouds"] || [u containsString:@"slacover"] ||
+        [u containsString:@"slapower"] || [u containsString:@"slcloudstore"] ||
+        [u containsString:@"sladoc"] || [u containsString:@"surfonline"] ||
+        [u containsString:@"shanlian"] || [u containsString:@"nodes"] ||
+        [u containsString:@"register"] || [u containsString:@"login"] ||
+        [u containsString:@"invite"] || [u containsString:@"user"] ||
+        [u containsString:@"token"]) {
+        NSMutableString *ms = [NSMutableString string];
+        [ms appendFormat:@"\n>>> OUT %@ %@", req.HTTPMethod ?: @"GET", u];
+        for (NSString *k in req.allHTTPHeaderFields) {
+            [ms appendFormat:@"\n    H %@: %@", k, req.allHTTPHeaderFields[k]];
+        }
+        if (bodyData.length) {
+            NSString *bs = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
+            if (bs.length > 800) bs = [bs substringToIndex:800];
+            [ms appendFormat:@"\n    BODY %@", bs ?: @""];
+        }
+        slLog(@"%@", ms);
+    }
+}
+
+@implementation SLReqProtocol
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    slLogRequest(request, request.HTTPBody);
+    return NO;  // 只观察，不拦截
+}
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
+- (void)startLoading {}
+- (void)stopLoading {}
+@end
+
+static id (*orig_slDataTask)(id, SEL, NSURLRequest *, id);
+
+static id slDataTaskHook(id self, SEL _cmd, NSURLRequest *req, id completion) {
+    @try {
+        slLogRequest(req, req.HTTPBody);
+    } @catch (NSException *e) {}
+    return ((id (*)(id, SEL, id, id))orig_slDataTask)(self, _cmd, req, completion);
+}
+
+static void slHookOutbound(void) {
+    [NSURLProtocol registerClass:[SLReqProtocol class]];
+    Method md = class_getInstanceMethod([NSURLSession class], @selector(dataTaskWithRequest:completionHandler:));
+    if (md) {
+        orig_slDataTask = (void *)method_getImplementation(md);
+        method_setImplementation(md, (IMP)slDataTaskHook);
+        slLog(@"outbound recorder installed (NSURLProtocol + dataTask)");
+    }
+}
+
 __attribute__((constructor)) static void slInit(void) {
+    slHookOutbound();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
                        slRunFlow();
