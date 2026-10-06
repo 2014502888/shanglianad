@@ -2,17 +2,13 @@
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
 
-// ===== ShanLianAD v3: 读取 App 现有登录 token → 直接抓节点 → Shadowrocket 订阅 =====
-// v3 变更：slregister 接口已 404，去掉自动注册；改为从 NSUserDefaults/Keychain 读取
-// 当前已登录的 token（用户手动注册/邀请后有有效会话），再调 /app/customer/slgetNodes。
+// ===== ShanLianAD v3.3: 真实 API 域名（抓包确认 api.aslafvbn.shop） =====
+// v3.3 变更：用户 ProxyPin 抓到 App 真实请求域名 = api.aslafvbn.shop
+// （之前 6 个域名全错/失效）。替换为主域名 + 保留旧 slapower 备选。
 
 static NSArray *slHosts(void) {
-    return @[@"https://api.slaclouds.com",
-             @"https://api.slacover.com",
-             @"https://api.slapower.com",
-             @"https://api.slcloudstore.com",
-             @"https://api.sladoc.com",
-             @"https://api.surfonline.vip:40443"];
+    return @[@"https://api.aslafvbn.shop",
+             @"https://api.slapower.com"];
 }
 
 static void slLog(NSString *fmt, ...) {
@@ -362,13 +358,13 @@ static void slLogRequest(NSURLRequest *req, NSData *bodyData) {
     if (!req.URL) return;
     NSString *u = req.URL.absoluteString;
     // 只记 API 类请求，过滤图片/统计
-    if ([u containsString:@"slaclouds"] || [u containsString:@"slacover"] ||
-        [u containsString:@"slapower"] || [u containsString:@"slcloudstore"] ||
-        [u containsString:@"sladoc"] || [u containsString:@"surfonline"] ||
-        [u containsString:@"shanlian"] || [u containsString:@"nodes"] ||
-        [u containsString:@"register"] || [u containsString:@"login"] ||
-        [u containsString:@"invite"] || [u containsString:@"user"] ||
-        [u containsString:@"token"]) {
+    if ([u containsString:@"aslafvbn"] || [u containsString:@"slaclouds"] ||
+        [u containsString:@"slacover"] || [u containsString:@"slapower"] ||
+        [u containsString:@"slcloudstore"] || [u containsString:@"sladoc"] ||
+        [u containsString:@"surfonline"] || [u containsString:@"shanlian"] ||
+        [u containsString:@"nodes"] || [u containsString:@"register"] ||
+        [u containsString:@"login"] || [u containsString:@"invite"] ||
+        [u containsString:@"user"] || [u containsString:@"token"]) {
         NSMutableString *ms = [NSMutableString string];
         [ms appendFormat:@"\n>>> OUT %@ %@", req.HTTPMethod ?: @"GET", u];
         for (NSString *k in req.allHTTPHeaderFields) {
