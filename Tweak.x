@@ -1,11 +1,16 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 
-// ===== ShanLianAD v1: 闪连VPN 自动注册+邀请88888888+抓节点→Shadowrocket订阅 =====
+// ===== ShanLianAD v2: 闪连VPN 自动注册+邀请88888888+抓节点→Shadowrocket订阅（多域名自动切换）=====
 
-static NSString *slBaseURL(void) {
-    // App 主后端；多线路可切换
-    return @"https://api.slaclouds.com";
+static NSArray *slHosts(void) {
+    // App 多线路；主域名被墙时自动切下一个
+    return @[@"https://api.slaclouds.com",
+             @"https://api.slacover.com",
+             @"https://api.slapower.com",
+             @"https://api.slcloudstore.com",
+             @"https://api.sladoc.com",
+             @"https://api.surfonline.vip:40443"];
 }
 
 static void slLog(NSString *fmt, ...) {
@@ -40,11 +45,16 @@ static void slShowAlert(NSString *title, NSString *msg) {
     });
 }
 
-// 通用请求：POST/GET JSON
-static void slRequest(NSString *method, NSString *path, NSDictionary *body, NSString *token, void (^done)(NSDictionary *json, NSString *raw, NSError *err)) {
-    NSURL *url = [NSURL URLWithString:[slBaseURL() stringByAppendingString:path]];
+// 通用请求：POST/GET JSON，hostIndex 为域名序号（超时/失败自动切下一个，最多 6 个）
+static void slRequestInternal(NSString *method, NSString *path, NSDictionary *body, NSString *token, int hostIndex, void (^done)(NSDictionary *json, NSString *raw, NSError *err, BOOL lastTry)) {
+    NSArray *hosts = slHosts();
+    if (hostIndex >= (int)hosts.count) {
+        if (done) done(nil, @"", nil, YES);
+        return;
+    }
+    NSURL *url = [NSURL URLWithString:[hosts[hostIndex] stringByAppendingString:path]];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-    req.timeoutInterval = 20;
+    req.timeoutInterval = 10;   // 10 秒超时，快速切换下一个域名
     if ([method isEqualToString:@"POST"]) {
         req.HTTPMethod = @"POST";
         [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
@@ -62,13 +72,25 @@ static void slRequest(NSString *method, NSString *path, NSDictionary *body, NSSt
 
     NSURLSession *sess = [NSURLSession sessionWithConfiguration:[NSURLSessionConfiguration defaultSessionConfiguration]];
     [[sess dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        BOOL isLast = (hostIndex >= (int)hosts.count - 1);
+        if (err) {
+            slLog(@"%@ %@ 域名%@失败 err=%@", method, path, hosts[hostIndex], err);
+            slRequestInternal(method, path, body, token, hostIndex + 1, done);
+            return;
+        }
         NSString *raw = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : @"";
         NSDictionary *json = nil;
         if (data.length) {
             json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
         }
-        done(json, raw, err);
+        if (done) done(json, raw, nil, isLast);
     }] resume];
+}
+
+static void slRequest(NSString *method, NSString *path, NSDictionary *body, NSString *token, void (^done)(NSDictionary *json, NSString *raw, NSError *err)) {
+    slRequestInternal(method, path, body, token, 0, ^(NSDictionary *json, NSString *raw, NSError *err, BOOL last) {
+        if (done) done(json, raw, err);
+    });
 }
 
 #pragma mark - 节点转 Shadowrocket
