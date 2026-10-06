@@ -194,10 +194,92 @@ static void slRequestInternal(NSString *method, NSString *path, NSDictionary *bo
     }] resume];
 }
 
+// 带自定义鉴权头的请求（v3.5 盲试鉴权格式用）
+static void slRequestWithHeader(NSString *method, NSString *path, NSDictionary *body, NSString *headerName, NSString *headerValue, void (^done)(NSDictionary *json, NSString *raw, NSError *err, BOOL lastTry)) {
+    NSArray *hosts = slHosts();
+    if (!hosts.count) {
+        if (done) done(nil, @"", nil, YES);
+        return;
+    }
+    NSURL *url = [NSURL URLWithString:[hosts[0] stringByAppendingString:path]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.timeoutInterval = 10;
+    if ([method isEqualToString:@"POST"]) {
+        req.HTTPMethod = @"POST";
+        [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+        req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body ?: @{} options:0 error:nil];
+    }
+    if (headerName && headerValue) {
+        [req setValue:headerValue forHTTPHeaderField:headerName];
+    }
+    [req setValue:@"application/json" forHTTPHeaderField:@"Accept"];
+    [req setValue:@"ShanLianVPN/4.5.4 (iPhone; iOS 17.0)" forHTTPHeaderField:@"User-Agent"];
+
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
+    cfg.connectionProxyDictionary = @{};   // 直连
+    cfg.timeoutIntervalForRequest = 10;
+    cfg.timeoutIntervalForResource = 10;
+    NSURLSession *sess = [NSURLSession sessionWithConfiguration:cfg delegate:slSessionDelegateInstance() delegateQueue:nil];
+    [[sess dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        [sess invalidateAndCancel];
+        if (err) {
+            if (done) done(nil, @"", err, YES);
+            return;
+        }
+        NSString *raw = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : @"";
+        NSDictionary *json = nil;
+        if (data.length) {
+            json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        }
+        if (done) done(json, raw, nil, YES);
+    }] resume];
+}
+
 static void slRequest(NSString *method, NSString *path, NSDictionary *body, NSString *token, void (^done)(NSDictionary *json, NSString *raw, NSError *err)) {
     slRequestInternal(method, path, body, token, 0, ^(NSDictionary *json, NSString *raw, NSError *err, BOOL last) {
         if (done) done(json, raw, err);
     });
+}
+
+// 处理节点响应（成功路径）
+static void slHandleNodesResponse(NSDictionary *json, NSString *raw, NSString *from) {
+    slLog(@"节点响应长度: %lu (来自 %@)", (unsigned long)raw.length, from);
+    NSString *docDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    [raw writeToFile:[docDir stringByAppendingPathComponent:@"sl_nodes_raw.json"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    NSMutableArray *uris = [NSMutableArray array];
+    if ([json isKindOfClass:[NSDictionary class]] || [json isKindOfClass:[NSArray class]]) {
+        slCollectNodes(json, uris, 0);
+    }
+    // 响应可能是纯文本订阅（每行一个节点）
+    if (uris.count == 0 && raw.length > 20) {
+        for (NSString *line in [raw componentsSeparatedByString:@"\n"]) {
+            if ([line hasPrefix:@"vless://"] || [line hasPrefix:@"vmess://"] ||
+                [line hasPrefix:@"trojan://"] || [line hasPrefix:@"ss://"] ||
+                [line hasPrefix:@"hysteria"]) {
+                [uris addObject:line];
+            }
+        }
+    }
+
+    if (uris.count == 0) {
+        slLog(@"未解析出节点，完整响应前500: %@", raw.length > 500 ? [raw substringToIndex:500] : raw);
+        slShowAlert(@"闪连助手", [NSString stringWithFormat:@"拿到响应但未解析出节点\n原始JSON已存 Documents/sl_nodes_raw.json\n前500字符:\n%@",
+                                  raw.length > 500 ? [raw substringToIndex:500] : raw]);
+        return;
+    }
+
+    NSString *subText = [uris componentsJoinedByString:@"\n"];
+    NSData *subData = [subText dataUsingEncoding:NSUTF8StringEncoding];
+    NSString *subB64 = [[subData base64EncodedStringWithOptions:0] stringByReplacingOccurrencesOfString:@"=" withString:@""];
+    NSString *subLink = [@"sub://" stringByAppendingString:subB64];
+
+    UIPasteboard *pb = [UIPasteboard generalPasteboard];
+    pb.string = subLink;
+    [subText writeToFile:[docDir stringByAppendingPathComponent:@"sl_sub.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    slLog(@"成功: %lu 节点, 订阅已复制", (unsigned long)uris.count);
+    slShowAlert(@"闪连助手", [NSString stringWithFormat:@"抓取 %lu 个节点\n订阅已复制到剪贴板\nShadowrocket 粘贴导入即可", (unsigned long)uris.count]);
 }
 
 #pragma mark - 节点转 Shadowrocket
@@ -286,6 +368,43 @@ static void slCollectNodes(id obj, NSMutableArray *uris, int depth) {
 
 #pragma mark - 主流程：读 token → 抓节点
 
+// 尝试多种鉴权头组合（服务端 401 = 鉴权格式不对，逐个试）
+static void slTryAuthVariants(NSString *token, NSString *path) {
+    NSArray *variants = @[
+        @{@"name": @"Bearer",  @"header": @"Authorization", @"value": [@"Bearer " stringByAppendingString:token]},
+        @{@"name": @"rawAuth", @"header": @"Authorization", @"value": token},
+        @{@"name": @"tokenH",  @"header": @"token",         @"value": token},
+        @{@"name": @"xToken",  @"header": @"x-token",       @"value": token},
+        @{@"name": @"accTok",  @"header": @"accessToken",   @"value": token},
+        @{@"name": @"xAccTok", @"header": @"x-access-token",@"value": token},
+    ];
+    __block BOOL done = NO;
+    for (NSDictionary *v in variants) {
+        if (done) break;
+        NSString *hname = v[@"header"];
+        NSString *hval = v[@"value"];
+        slLog(@"尝试鉴权: %@ = %@...", hname, hval.length > 24 ? [hval substringToIndex:24] : hval);
+        slRequestWithHeader(@"GET", path, nil, hname, hval, ^(NSDictionary *json, NSString *raw, NSError *err, BOOL lastTry) {
+            if (err) {
+                slLog(@"  %@ 失败 err=%@", hname, err.localizedDescription);
+                return;
+            }
+            BOOL ok = !([raw containsString:@"401"] || [raw containsString:@"无权限"] || [raw containsString:@"\"code\":401"]);
+            slLog(@"  %@ 响应: %@ -> %@", hname, raw.length > 120 ? [raw substringToIndex:120] : raw,
+                  ok ? @"可能成功" : @"仍失败");
+            if (ok && raw.length > 50) {
+                done = YES;
+                slHandleNodesResponse(json, raw, [NSString stringWithFormat:@"鉴权头 %@", hname]);
+            }
+        });
+        [NSThread sleepForTimeInterval:0.8];  // 间隔，避免触发风控
+    }
+    if (!done) {
+        slLog(@"全部鉴权方式均失败，请抓包确认真实请求头");
+        slShowAlert(@"闪连助手", @"所有常见鉴权方式均返回 401\n请用 ProxyPin 抓一次「点连接」的包发给我");
+    }
+}
+
 static void slRunFlow(void) {
     slLog(@"===== 闪连抓节点开始(读现有登录态) %@ =====", [NSDate date]);
 
@@ -307,47 +426,7 @@ static void slRunFlow(void) {
     }
     slLog(@"使用 token len=%lu", (unsigned long)token.length);
 
-    slRequest(@"GET", @"/app/customer/slgetNodes", nil, token, ^(NSDictionary *json, NSString *raw, NSError *err) {
-        if (err) {
-            slLog(@"节点请求失败 err=%@", err);
-            slShowAlert(@"闪连助手", [NSString stringWithFormat:@"节点请求失败\n%@", err.localizedDescription]);
-            return;
-        }
-        slLog(@"节点响应长度: %lu", (unsigned long)raw.length);
-        NSString *docDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
-        [raw writeToFile:[docDir stringByAppendingPathComponent:@"sl_nodes_raw.json"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-        // 若响应含 base64 密文特征（如 rivoLinks 式），提示用户把原始 JSON 发回，再适配解密
-        if ([raw containsString:@"rivoLinks"] || [raw containsString:@"links"] ||
-            [raw containsString:@"dataList"] || [raw containsString:@"encrypt"] ||
-            [raw containsString:@"cipher"]) {
-            slLog(@"响应可能含密文字段，先保存原始数据");
-        }
-
-        NSMutableArray *uris = [NSMutableArray array];
-        if ([json isKindOfClass:[NSDictionary class]] || [json isKindOfClass:[NSArray class]]) {
-            slCollectNodes(json, uris, 0);
-        }
-
-        if (uris.count == 0) {
-            slLog(@"未解析出节点，完整响应前500: %@", raw.length > 500 ? [raw substringToIndex:500] : raw);
-            slShowAlert(@"闪连助手", [NSString stringWithFormat:@"拿到响应但未解析出节点\n原始JSON已存 Documents/sl_nodes_raw.json\n前500字符:\n%@",
-                                      raw.length > 500 ? [raw substringToIndex:500] : raw]);
-            return;
-        }
-
-        NSString *subText = [uris componentsJoinedByString:@"\n"];
-        NSData *subData = [subText dataUsingEncoding:NSUTF8StringEncoding];
-        NSString *subB64 = [[subData base64EncodedStringWithOptions:0] stringByReplacingOccurrencesOfString:@"=" withString:@""];
-        NSString *subLink = [@"sub://" stringByAppendingString:subB64];
-
-        UIPasteboard *pb = [UIPasteboard generalPasteboard];
-        pb.string = subLink;
-        [subText writeToFile:[docDir stringByAppendingPathComponent:@"sl_sub.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-        slLog(@"成功: %lu 节点, 订阅已复制", (unsigned long)uris.count);
-        slShowAlert(@"闪连助手", [NSString stringWithFormat:@"抓取 %lu 个节点\n订阅已复制到剪贴板\nShadowrocket 粘贴导入即可", (unsigned long)uris.count]);
-    });
+    slTryAuthVariants(token, @"/app/customer/slgetNodes");
 }
 
 #pragma mark - 出站请求记录（看 App 真实怎么带鉴权）
