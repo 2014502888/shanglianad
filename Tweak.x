@@ -1,10 +1,12 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <Security/Security.h>
 
-// ===== ShanLianAD v2: 闪连VPN 自动注册+邀请88888888+抓节点→Shadowrocket订阅（多域名自动切换）=====
+// ===== ShanLianAD v3: 读取 App 现有登录 token → 直接抓节点 → Shadowrocket 订阅 =====
+// v3 变更：slregister 接口已 404，去掉自动注册；改为从 NSUserDefaults/Keychain 读取
+// 当前已登录的 token（用户手动注册/邀请后有有效会话），再调 /app/customer/slgetNodes。
 
 static NSArray *slHosts(void) {
-    // App 多线路；主域名被墙时自动切下一个
     return @[@"https://api.slaclouds.com",
              @"https://api.slacover.com",
              @"https://api.slapower.com",
@@ -45,7 +47,77 @@ static void slShowAlert(NSString *title, NSString *msg) {
     });
 }
 
-// 通用请求：POST/GET JSON，hostIndex 为域名序号（超时/失败自动切下一个，最多 6 个）
+#pragma mark - 从 App 存储读取现有 token
+
+static NSDictionary *slScanUserDefaults(void) {
+    // 枚举 NSUserDefaults 全部 key，找含 token/auth 的
+    NSMutableDictionary *found = [NSMutableDictionary dictionary];
+    NSDictionary *rep = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+    for (NSString *k in rep) {
+        NSString *low = [k lowercaseString];
+        if ([low containsString:@"token"] || [low containsString:@"auth"] ||
+            [low containsString:@"session"] || [low containsString:@"login"] ||
+            [low containsString:@"user"]) {
+            id v = rep[k];
+            if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 8) {
+                found[k] = v;
+            } else if ([v isKindOfClass:[NSData class]] && [(NSData *)v length] > 8) {
+                found[k] = [[NSString alloc] initWithData:(NSData *)v encoding:NSUTF8StringEncoding] ?: @"";
+            }
+        }
+    }
+    return found;
+}
+
+static NSString *slScanKeychain(void) {
+    NSMutableDictionary *query = [NSMutableDictionary dictionary];
+    query[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
+    query[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitAll;
+    query[(__bridge id)kSecReturnAttributes] = @YES;
+    query[(__bridge id)kSecReturnData] = @YES;
+    CFArrayRef results = NULL;
+    OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)query, (CFTypeRef *)&results);
+    if (st != errSecSuccess || !results) return nil;
+    NSArray *items = (__bridge_transfer NSArray *)results;
+    NSString *best = nil;
+    for (NSDictionary *item in items) {
+        NSData *data = item[(__bridge id)kSecValueData];
+        NSString *str = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
+        NSDictionary *attrs = item[(__bridge id)kSecAttrGeneric] ? @{} : item;
+        NSString *svc = attrs[(__bridge id)kSecAttrService] ?: @"";
+        NSString *acct = attrs[(__bridge id)kSecAttrAccount] ?: @"";
+        slLog(@"keychain item: svc=%@ acct=%@ len=%lu", svc, acct, (unsigned long)str.length);
+        if (str.length > 20 && ([str rangeOfString:@"Bearer"].location != NSNotFound ||
+                                [str rangeOfString:@"token"].location != NSNotFound ||
+                                [str rangeOfString:@"access"].location != NSNotFound)) {
+            if (!best || str.length > best.length) best = str;
+        }
+    }
+    return best;
+}
+
+// 从所有候选中挑最像 token 的（长的纯字符串/含 token 特征）
+static NSString *slPickToken(NSDictionary *found, NSString *keychainStr) {
+    if (keychainStr.length > 20) return keychainStr;
+    NSString *best = nil;
+    for (NSString *k in found) {
+        NSString *v = found[k];
+        NSString *low = [k lowercaseString];
+        if ([low containsString:@"token"] || [low containsString:@"auth"] || [low containsString:@"session"]) {
+            if (!best || v.length > best.length) best = v;
+        }
+    }
+    if (!best) {
+        for (NSString *k in found) {
+            NSString *v = found[k];
+            if (!best || v.length > best.length) best = v;
+        }
+    }
+    return best;
+}
+
+#pragma mark - 请求
+
 static void slRequestInternal(NSString *method, NSString *path, NSDictionary *body, NSString *token, int hostIndex, void (^done)(NSDictionary *json, NSString *raw, NSError *err, BOOL lastTry)) {
     NSArray *hosts = slHosts();
     if (hostIndex >= (int)hosts.count) {
@@ -54,15 +126,11 @@ static void slRequestInternal(NSString *method, NSString *path, NSDictionary *bo
     }
     NSURL *url = [NSURL URLWithString:[hosts[hostIndex] stringByAppendingString:path]];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-    req.timeoutInterval = 10;   // 10 秒超时，快速切换下一个域名
+    req.timeoutInterval = 10;
     if ([method isEqualToString:@"POST"]) {
         req.HTTPMethod = @"POST";
         [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-        if (body) {
-            req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
-        } else {
-            req.HTTPBody = [@"{}" dataUsingEncoding:NSUTF8StringEncoding];
-        }
+        req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body ?: @{} options:0 error:nil];
     }
     if (token) {
         [req setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
@@ -71,7 +139,7 @@ static void slRequestInternal(NSString *method, NSString *path, NSDictionary *bo
     [req setValue:@"ShanLianVPN/4.5.4 (iPhone; iOS 17.0)" forHTTPHeaderField:@"User-Agent"];
 
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
-    cfg.connectionProxyDictionary = @{};   // 禁用系统代理，直连（App的Flutter请求是直连的，这样才能连上主域名）
+    cfg.connectionProxyDictionary = @{};
     NSURLSession *sess = [NSURLSession sessionWithConfiguration:cfg];
     [[sess dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         BOOL isLast = (hostIndex >= (int)hosts.count - 1);
@@ -98,28 +166,37 @@ static void slRequest(NSString *method, NSString *path, NSDictionary *body, NSSt
 #pragma mark - 节点转 Shadowrocket
 
 static NSString *slURIFromDict(NSDictionary *d) {
-    NSString *name = d[@"name"] ?: d[@"remark"] ?: d[@"title"] ?: d[@"ps"] ?: @"sl";
+    NSString *name = d[@"name"] ?: d[@"remark"] ?: d[@"title"] ?: d[@"ps"] ?: d[@"tag"] ?: @"sl";
     NSString *host = d[@"server"] ?: d[@"host"] ?: d[@"address"] ?: d[@"addr"] ?: d[@"ip"];
-    NSNumber *portN = d[@"port"];
+    NSNumber *portN = d[@"port"] ?: d[@"server_port"];
     if (!host || !portN) return nil;
     NSString *port = [portN stringValue];
-    NSString *uuid = d[@"uuid"] ?: d[@"id"] ?: d[@"password"];
+    NSString *uuid = d[@"uuid"] ?: d[@"id"];
     NSString *method = d[@"method"] ?: d[@"cipher"] ?: @"aes-128-gcm";
     NSString *passwd = d[@"password"] ?: d[@"key"];
-    NSString *sni = d[@"sni"] ?: d[@"servername"] ?: d[@"serverName"] ?: d[@"host"];
+    NSString *sni = d[@"sni"] ?: d[@"servername"] ?: d[@"serverName"];
+    NSDictionary *tls = d[@"tls"];
+    if ([tls isKindOfClass:[NSDictionary class]] && !sni) sni = tls[@"server_name"] ?: tls[@"serverName"];
+    NSString *type = d[@"type"] ?: d[@"protocol"];
+    if ([type isKindOfClass:[NSString class]]) {
+        if ([type isEqualToString:@"selector"] || [type isEqualToString:@"urltest"] ||
+            [type isEqualToString:@"direct"] || [type isEqualToString:@"block"] ||
+            [type isEqualToString:@"dns"] || [type isEqualToString:@"reject"] ||
+            [type isEqualToString:@"loopback"] || [type isEqualToString:@"wireguard"]) {
+            return nil;
+        }
+    }
 
     NSData *nameData = [name dataUsingEncoding:NSUTF8StringEncoding];
     NSString *nameB64 = [nameData base64EncodedStringWithOptions:0];
 
     if (uuid && passwd && [passwd length] > 0) {
-        NSString *tp = [NSString stringWithFormat:@"%@:%@@%@:%@?peer=%@#%@",
-                        uuid, passwd, host, port, sni ?: @"", nameB64];
-        return [@"trojan://" stringByAppendingString:tp];
+        return [@"trojan://" stringByAppendingString:[NSString stringWithFormat:@"%@:%@@%@:%@?peer=%@#%@",
+                                                      uuid, passwd, host, port, sni ?: @"", nameB64]];
     }
     if (uuid) {
-        NSString *vp = [NSString stringWithFormat:@"%@:%@@%@:%@?encryption=none&security=tls&sni=%@#%@",
-                        uuid, @"", host, port, sni ?: @"", nameB64];
-        return [@"vless://" stringByAppendingString:vp];
+        return [@"vless://" stringByAppendingString:[NSString stringWithFormat:@"%@:%@@%@:%@?encryption=none&security=tls&sni=%@#%@",
+                                                     uuid, @"", host, port, sni ?: @"", nameB64]];
     }
     if (passwd && method) {
         NSData *userinfo = [[NSString stringWithFormat:@"%@:%@", method, passwd] dataUsingEncoding:NSUTF8StringEncoding];
@@ -137,16 +214,31 @@ static void slCollectNodes(id obj, NSMutableArray *uris, int depth) {
         }
     } else if ([obj isKindOfClass:[NSDictionary class]]) {
         NSDictionary *d = (NSDictionary *)obj;
-        for (NSString *key in @[@"outbounds", @"nodes", @"servers", @"serverList", @"list", @"proxies", @"configs", @"data", @"subs", @"groups", @"items"]) {
+        for (NSString *key in @[@"outbounds", @"nodes", @"servers", @"serverList", @"list", @"proxies", @"configs", @"data", @"subs", @"groups", @"items", @"list2", @"urls", @"links", @"v2ray", @"nodesList", @"nodeList"]) {
             id val = d[key];
             if ([val isKindOfClass:[NSArray class]]) {
                 for (id item in (NSArray *)val) {
                     if ([item isKindOfClass:[NSDictionary class]]) {
                         NSString *uri = slURIFromDict((NSDictionary *)item);
                         if (uri) [uris addObject:uri];
+                    } else if ([item isKindOfClass:[NSString class]]) {
+                        NSString *str = (NSString *)item;
+                        if ([str hasPrefix:@"vless://"] || [str hasPrefix:@"vmess://"] ||
+                            [str hasPrefix:@"trojan://"] || [str hasPrefix:@"ss://"] ||
+                            [str hasPrefix:@"hysteria"]) {
+                            [uris addObject:str];
+                        } else {
+                            slCollectNodes(item, uris, depth + 1);
+                        }
                     } else {
                         slCollectNodes(item, uris, depth + 1);
                     }
+                }
+            } else if ([val isKindOfClass:[NSString class]]) {
+                NSString *str = (NSString *)val;
+                if ([str hasPrefix:@"vless://"] || [str hasPrefix:@"vmess://"] ||
+                    [str hasPrefix:@"trojan://"] || [str hasPrefix:@"ss://"]) {
+                    [uris addObject:str];
                 }
             }
         }
@@ -155,88 +247,69 @@ static void slCollectNodes(id obj, NSMutableArray *uris, int depth) {
     }
 }
 
-#pragma mark - 主流程：注册(带邀请码) → 节点
+#pragma mark - 主流程：读 token → 抓节点
 
 static void slRunFlow(void) {
-    slLog(@"===== 闪连自动流程开始 %@ =====", [NSDate date]);
+    slLog(@"===== 闪连抓节点开始(读现有登录态) %@ =====", [NSDate date]);
 
-    // 1) 注册（游客注册，密码随机，注册时直接带邀请码）
-    NSString *pwd = [NSString stringWithFormat:@"ShanLian%u%u", arc4random() % 9000 + 1000, arc4random() % 9000 + 1000];
-    NSDictionary *regBody = @{ @"password": pwd, @"inviteCode": @"88888888" };
-    slLog(@"POST /app/tourist/slregister body=%@", regBody);
+    NSDictionary *found = slScanUserDefaults();
+    slLog(@"UserDefaults 候选 key 数: %lu", (unsigned long)found.count);
+    for (NSString *k in found) {
+        NSString *v = found[k];
+        slLog(@"  key=%@ len=%lu prefix=%@", k, (unsigned long)v.length,
+              v.length > 30 ? [v substringToIndex:30] : v);
+    }
+    NSString *keychain = slScanKeychain();
+    if (keychain.length) slLog(@"Keychain 命中 token len=%lu", (unsigned long)keychain.length);
 
-    slRequest(@"POST", @"/app/tourist/slregister", regBody, nil, ^(NSDictionary *json, NSString *raw, NSError *err) {
+    NSString *token = slPickToken(found, keychain);
+    if (!token.length) {
+        slLog(@"未找到任何 token，请确认 App 已登录");
+        slShowAlert(@"闪连助手", @"未找到登录 token\n请先在闪连VPN里登录一次再试");
+        return;
+    }
+    slLog(@"使用 token len=%lu", (unsigned long)token.length);
+
+    slRequest(@"GET", @"/app/customer/slgetNodes", nil, token, ^(NSDictionary *json, NSString *raw, NSError *err) {
         if (err) {
-            slLog(@"注册失败 err=%@ raw=%@", err, raw);
-            slShowAlert(@"闪连助手", [NSString stringWithFormat:@"注册失败\n%@\n%@", err.localizedDescription, raw.length ? raw : @"(空响应)"]);
+            slLog(@"节点请求失败 err=%@", err);
+            slShowAlert(@"闪连助手", [NSString stringWithFormat:@"节点请求失败\n%@", err.localizedDescription]);
             return;
         }
-        slLog(@"注册响应: %@", raw);
+        slLog(@"节点响应长度: %lu", (unsigned long)raw.length);
+        NSString *docDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+        [raw writeToFile:[docDir stringByAppendingPathComponent:@"sl_nodes_raw.json"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
-        NSDictionary *data = nil;
-        if ([json isKindOfClass:[NSDictionary class]]) data = json[@"data"];
-        if (![data isKindOfClass:[NSDictionary class]]) data = json;
-
-        NSString *token = data[@"token"] ?: data[@"accessToken"] ?: data[@"authToken"] ?: data[@"sessionToken"] ?: data[@"ticket"] ?: json[@"token"] ?: data[@"userToken"];
-        if (!token && [data isKindOfClass:[NSDictionary class]]) {
-            // 再挖一层
-            for (NSString *k in data.allKeys) {
-                id v = data[k];
-                if ([v isKindOfClass:[NSDictionary class]] && !token) {
-                    token = v[@"token"] ?: v[@"accessToken"] ?: v[@"authToken"];
-                }
-            }
+        // 若响应含 base64 密文特征（如 rivoLinks 式），提示用户把原始 JSON 发回，再适配解密
+        if ([raw containsString:@"rivoLinks"] || [raw containsString:@"links"] ||
+            [raw containsString:@"dataList"] || [raw containsString:@"encrypt"] ||
+            [raw containsString:@"cipher"]) {
+            slLog(@"响应可能含密文字段，先保存原始数据");
         }
-        if (!token) {
-            slLog(@"未解析到token，完整响应: %@", raw);
-            slShowAlert(@"闪连助手", [NSString stringWithFormat:@"注册返回但未解析到token\n%@", raw.length ? raw : @"(空)"]);
+
+        NSMutableArray *uris = [NSMutableArray array];
+        if ([json isKindOfClass:[NSDictionary class]] || [json isKindOfClass:[NSArray class]]) {
+            slCollectNodes(json, uris, 0);
+        }
+
+        if (uris.count == 0) {
+            slLog(@"未解析出节点，完整响应前500: %@", raw.length > 500 ? [raw substringToIndex:500] : raw);
+            slShowAlert(@"闪连助手", [NSString stringWithFormat:@"拿到响应但未解析出节点\n原始JSON已存 Documents/sl_nodes_raw.json\n前500字符:\n%@",
+                                      raw.length > 500 ? [raw substringToIndex:500] : raw]);
             return;
         }
-        slLog(@"token=%@", token);
 
-        // 2) 确认填邀请码（注册已带的话这里可重复，一般幂等）
-        slRequest(@"POST", @"/app/customer/slfillInviteCode", @{ @"inviteCode": @"88888888" }, token, ^(NSDictionary *j2, NSString *raw2, NSError *e2) {
-            if (e2 || !j2) {
-                slLog(@"填邀请码失败 err=%@ raw=%@", e2, raw2);
-            } else {
-                slLog(@"填邀请码响应: %@", raw2);
-            }
-            // 3) 拿节点
-            slRequest(@"GET", @"/app/customer/slgetNodes", nil, token, ^(NSDictionary *j3, NSString *raw3, NSError *e3) {
-                if (e3) {
-                    slLog(@"节点请求失败 err=%@", e3);
-                    slShowAlert(@"闪连助手", [NSString stringWithFormat:@"节点请求失败\n%@", e3.localizedDescription]);
-                    return;
-                }
-                slLog(@"节点响应: %@", raw3.length > 3000 ? [raw3 substringToIndex:3000] : raw3);
+        NSString *subText = [uris componentsJoinedByString:@"\n"];
+        NSData *subData = [subText dataUsingEncoding:NSUTF8StringEncoding];
+        NSString *subB64 = [[subData base64EncodedStringWithOptions:0] stringByReplacingOccurrencesOfString:@"=" withString:@""];
+        NSString *subLink = [@"sub://" stringByAppendingString:subB64];
 
-                NSMutableArray *uris = [NSMutableArray array];
-                if ([j3 isKindOfClass:[NSDictionary class]] || [j3 isKindOfClass:[NSArray class]]) {
-                    slCollectNodes(j3, uris, 0);
-                }
+        UIPasteboard *pb = [UIPasteboard generalPasteboard];
+        pb.string = subLink;
+        [subText writeToFile:[docDir stringByAppendingPathComponent:@"sl_sub.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
-                NSString *docDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
-                [raw3 writeToFile:[docDir stringByAppendingPathComponent:@"sl_nodes_raw.json"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-                if (uris.count == 0) {
-                    slLog(@"未解析到节点，原始数据已存 sl_nodes_raw.json");
-                    slShowAlert(@"闪连助手", [NSString stringWithFormat:@"拿到数据但未解析出节点\n原始JSON已存 Documents/sl_nodes_raw.json\n%@", raw3.length ? [raw3 substringToIndex:500] : @"(空)"]);
-                    return;
-                }
-
-                NSString *subText = [uris componentsJoinedByString:@"\n"];
-                NSData *subData = [subText dataUsingEncoding:NSUTF8StringEncoding];
-                NSString *subB64 = [[subData base64EncodedStringWithOptions:0] stringByReplacingOccurrencesOfString:@"=" withString:@""];
-                NSString *subLink = [@"sub://" stringByAppendingString:subB64];
-
-                UIPasteboard *pb = [UIPasteboard generalPasteboard];
-                pb.string = subLink;
-                [subText writeToFile:[docDir stringByAppendingPathComponent:@"sl_sub.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-                slLog(@"成功: %lu 节点, 订阅已复制", (unsigned long)uris.count);
-                slShowAlert(@"闪连助手", [NSString stringWithFormat:@"抓取 %lu 个节点\n订阅已复制到剪贴板\nShadowrocket 粘贴导入即可", (unsigned long)uris.count]);
-            });
-        });
+        slLog(@"成功: %lu 节点, 订阅已复制", (unsigned long)uris.count);
+        slShowAlert(@"闪连助手", [NSString stringWithFormat:@"抓取 %lu 个节点\n订阅已复制到剪贴板\nShadowrocket 粘贴导入即可", (unsigned long)uris.count]);
     });
 }
 
