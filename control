@@ -1,0 +1,8 @@
+Package: com.shanlian.ad
+Name: ShanLianAD
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: 闪连VPN 自动注册+邀请码88888888+抓节点生成Shadowrocket订阅
+Maintainer: user
+Author: user
+Section: Tweaks
