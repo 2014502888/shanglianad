@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
+#import <objc/runtime.h>
 
 // ===== ShanLianAD v3.3: 真实 API 域名（抓包确认 api.aslafvbn.shop） =====
 // v3.3 变更：用户 ProxyPin 抓到 App 真实请求域名 = api.aslafvbn.shop
