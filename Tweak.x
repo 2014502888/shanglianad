@@ -70,7 +70,9 @@ static void slRequestInternal(NSString *method, NSString *path, NSDictionary *bo
     [req setValue:@"application/json" forHTTPHeaderField:@"Accept"];
     [req setValue:@"ShanLianVPN/4.5.4 (iPhone; iOS 17.0)" forHTTPHeaderField:@"User-Agent"];
 
-    NSURLSession *sess = [NSURLSession sessionWithConfiguration:[NSURLSessionConfiguration defaultSessionConfiguration]];
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
+    cfg.connectionProxyDictionary = @{};   // 禁用系统代理，直连（App的Flutter请求是直连的，这样才能连上主域名）
+    NSURLSession *sess = [NSURLSession sessionWithConfiguration:cfg];
     [[sess dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         BOOL isLast = (hostIndex >= (int)hosts.count - 1);
         if (err) {
