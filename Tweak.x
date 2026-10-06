@@ -96,27 +96,63 @@ static NSString *slScanKeychain(void) {
     return best;
 }
 
-// 从所有候选中挑最像 token 的（长的纯字符串/含 token 特征）
+// 从所有候选中挑最像 token 的：优先解析 JSON 里的 token 字段
 static NSString *slPickToken(NSDictionary *found, NSString *keychainStr) {
     if (keychainStr.length > 20) return keychainStr;
     NSString *best = nil;
     for (NSString *k in found) {
         NSString *v = found[k];
         NSString *low = [k lowercaseString];
-        if ([low containsString:@"token"] || [low containsString:@"auth"] || [low containsString:@"session"]) {
-            if (!best || v.length > best.length) best = v;
+        // 若值是 JSON，尝试取 token / accessToken / userToken 字段
+        if ([v hasPrefix:@"{"]) {
+            NSData *d = [v dataUsingEncoding:NSUTF8StringEncoding];
+            NSError *err = nil;
+            id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:&err];
+            if (!err && [obj isKindOfClass:[NSDictionary class]]) {
+                NSDictionary *dict = (NSDictionary *)obj;
+                for (NSString *tk in @[@"token", @"accessToken", @"access_token", @"userToken", @"authToken", @"sessionToken", @"tokenValue"]) {
+                    id tv = dict[tk];
+                    if ([tv isKindOfClass:[NSString class]] && [(NSString *)tv length] > 10) {
+                        if (!best || [(NSString *)tv length] > best.length) best = tv;
+                    }
+                }
+            }
         }
-    }
-    if (!best) {
-        for (NSString *k in found) {
-            NSString *v = found[k];
-            if (!best || v.length > best.length) best = v;
+        if ([low containsString:@"token"] || [low containsString:@"auth"] || [low containsString:@"session"]) {
+            if (!best || v.length > best.length) {
+                // 仅当该值本身像 token（无大段 JSON 外壳）时兜底
+                if (![v hasPrefix:@"{"]) best = v;
+            }
         }
     }
     return best;
 }
 
-#pragma mark - 请求
+#pragma mark - 请求（禁用 SSL 证书校验，与 App 的 Flutter 一致）
+
+@interface SLURLSessionDelegate : NSObject <NSURLSessionDelegate>
+@end
+
+@implementation SLURLSessionDelegate
+- (void)URLSession:(NSURLSession *)session didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential *))completionHandler {
+    if ([challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodServerTrust]) {
+        // 直接信任任意服务器证书（App 的 Flutter 同样不校验）
+        NSURLCredential *cred = [NSURLCredential credentialForTrust:challenge.protectionSpace.serverTrust];
+        if (cred) {
+            completionHandler(NSURLSessionAuthChallengeUseCredential, cred);
+            return;
+        }
+    }
+    completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
+}
+@end
+
+static SLURLSessionDelegate *slSessionDelegateInstance(void) {
+    static SLURLSessionDelegate *d = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ d = [[SLURLSessionDelegate alloc] init]; });
+    return d;
+}
 
 static void slRequestInternal(NSString *method, NSString *path, NSDictionary *body, NSString *token, int hostIndex, void (^done)(NSDictionary *json, NSString *raw, NSError *err, BOOL lastTry)) {
     NSArray *hosts = slHosts();
@@ -126,7 +162,7 @@ static void slRequestInternal(NSString *method, NSString *path, NSDictionary *bo
     }
     NSURL *url = [NSURL URLWithString:[hosts[hostIndex] stringByAppendingString:path]];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-    req.timeoutInterval = 10;
+    req.timeoutInterval = 8;
     if ([method isEqualToString:@"POST"]) {
         req.HTTPMethod = @"POST";
         [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
@@ -139,15 +175,19 @@ static void slRequestInternal(NSString *method, NSString *path, NSDictionary *bo
     [req setValue:@"ShanLianVPN/4.5.4 (iPhone; iOS 17.0)" forHTTPHeaderField:@"User-Agent"];
 
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
-    cfg.connectionProxyDictionary = @{};
-    NSURLSession *sess = [NSURLSession sessionWithConfiguration:cfg];
+    cfg.connectionProxyDictionary = @{};   // 直连
+    cfg.timeoutIntervalForRequest = 8;
+    cfg.timeoutIntervalForResource = 8;
+    NSURLSession *sess = [NSURLSession sessionWithConfiguration:cfg delegate:slSessionDelegateInstance() delegateQueue:nil];
     [[sess dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         BOOL isLast = (hostIndex >= (int)hosts.count - 1);
         if (err) {
             slLog(@"%@ %@ 域名%@失败 err=%@", method, path, hosts[hostIndex], err);
+            [sess invalidateAndCancel];
             slRequestInternal(method, path, body, token, hostIndex + 1, done);
             return;
         }
+        [sess invalidateAndCancel];
         NSString *raw = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : @"";
         NSDictionary *json = nil;
         if (data.length) {
