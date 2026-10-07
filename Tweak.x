@@ -499,6 +499,8 @@ static void slTryFillInvite(NSString *token, void (^done)(BOOL ok)) {
     });
 }
 
+// v3.8.1: 停用后函数未使用触发 -Werror，加 unused 属性保留（恢复自动抓取时取消 slInit 调度即可）
+static void slRunFlow(void) __attribute__((unused));
 static void slRunFlow(void) {
     slLog(@"===== 闪连抓节点 v3.6 开始 %@ =====", [NSDate date]);
     slLog(@"deviceId=%@", slDeviceId());
