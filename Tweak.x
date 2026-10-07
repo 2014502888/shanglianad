@@ -2,14 +2,21 @@
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <CommonCrypto/CommonDigest.h>
 
-// ===== ShanLianAD v3.3: 真实 API 域名（抓包确认 api.aslafvbn.shop） =====
-// v3.3 变更：用户 ProxyPin 抓到 App 真实请求域名 = api.aslafvbn.shop
-// （之前 6 个域名全错/失效）。替换为主域名 + 保留旧 slapower 备选。
+// ===== ShanLianAD v3.6: 真实接口(带后缀) + 设备签名鉴权组合 + 自动游客注册/邀请码 =====
+// v3.6 变更（依据 App AOT 逆向）：
+//   - 真实接口名带混淆后缀（服务器剥后缀路由）：节点 = /app/customer/slgetNodesgs，
+//     游客注册 = /app/tourist/slgenRandomUsergr，注册 = /app/tourist/slregisterrr，
+//     填邀请码 = /app/customer/slfillInviteCodefe，设备登录 = /app/tourist/sldeviceLogindn。
+//   - 鉴权疑似 token + deviceSig(设备签名) + encryptUid，v3.5 只试 6 种裸 token 头故全 401。
+//   - 新增自动流程：无 token → 游客注册拿 token → 填邀请码 88888888 → 再抓节点。
+//   - 路径带后缀 + 组合头逐个实测，全程写 sl_debug.txt。
 
 static NSArray *slHosts(void) {
     return @[@"https://api.aslafvbn.shop",
-             @"https://api.slapower.com"];
+             @"https://api.qinghuapf.cn",
+             @"https://api.sladoc.com"];
 }
 
 static void slLog(NSString *fmt, ...) {
@@ -42,6 +49,31 @@ static void slShowAlert(NSString *title, NSString *msg) {
         [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
         [root presentViewController:ac animated:YES completion:nil];
     });
+}
+
+static NSString *slMD5(NSString *s) {
+    if (!s.length) return @"";
+    const char *cstr = [s UTF8String];
+    unsigned char digest[CC_MD5_DIGEST_LENGTH];
+    CC_MD5(cstr, (CC_LONG)strlen(cstr), digest);
+    NSMutableString *out = [NSMutableString string];
+    for (int i = 0; i < CC_MD5_DIGEST_LENGTH; i++) [out appendFormat:@"%02x", digest[i]];
+    return out;
+}
+
+// 固定设备 ID（首次运行生成并持久化，保证签名/注册一致性）
+static NSString *slDeviceId(void) {
+    NSString *k = @"sl_dylib_device_id";
+    NSString *v = [[NSUserDefaults standardUserDefaults] stringForKey:k];
+    if (!v.length) {
+        v = [[[NSUUID UUID] UUIDString] lowercaseString];
+        [[NSUserDefaults standardUserDefaults] setObject:v forKey:k];
+    }
+    return v;
+}
+
+static NSString *slTimestamp(void) {
+    return [NSString stringWithFormat:@"%lld", (long long)[[NSDate date] timeIntervalSince1970]];
 }
 
 #pragma mark - 从 App 存储读取现有 token
@@ -149,96 +181,6 @@ static SLURLSessionDelegate *slSessionDelegateInstance(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{ d = [[SLURLSessionDelegate alloc] init]; });
     return d;
-}
-
-static void slRequestInternal(NSString *method, NSString *path, NSDictionary *body, NSString *token, int hostIndex, void (^done)(NSDictionary *json, NSString *raw, NSError *err, BOOL lastTry)) {
-    NSArray *hosts = slHosts();
-    if (hostIndex >= (int)hosts.count) {
-        if (done) done(nil, @"", nil, YES);
-        return;
-    }
-    NSURL *url = [NSURL URLWithString:[hosts[hostIndex] stringByAppendingString:path]];
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-    req.timeoutInterval = 8;
-    if ([method isEqualToString:@"POST"]) {
-        req.HTTPMethod = @"POST";
-        [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-        req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body ?: @{} options:0 error:nil];
-    }
-    if (token) {
-        [req setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
-    }
-    [req setValue:@"application/json" forHTTPHeaderField:@"Accept"];
-    [req setValue:@"ShanLianVPN/4.5.4 (iPhone; iOS 17.0)" forHTTPHeaderField:@"User-Agent"];
-
-    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
-    cfg.connectionProxyDictionary = @{};   // 直连
-    cfg.timeoutIntervalForRequest = 8;
-    cfg.timeoutIntervalForResource = 8;
-    NSURLSession *sess = [NSURLSession sessionWithConfiguration:cfg delegate:slSessionDelegateInstance() delegateQueue:nil];
-    [[sess dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-        BOOL isLast = (hostIndex >= (int)hosts.count - 1);
-        if (err) {
-            slLog(@"%@ %@ 域名%@失败 err=%@", method, path, hosts[hostIndex], err);
-            [sess invalidateAndCancel];
-            slRequestInternal(method, path, body, token, hostIndex + 1, done);
-            return;
-        }
-        [sess invalidateAndCancel];
-        NSString *raw = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : @"";
-        NSDictionary *json = nil;
-        if (data.length) {
-            json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        }
-        if (done) done(json, raw, nil, isLast);
-    }] resume];
-}
-
-// 带自定义鉴权头的请求（v3.5 盲试鉴权格式用）
-static void slRequestWithHeader(NSString *method, NSString *path, NSDictionary *body, NSString *headerName, NSString *headerValue, void (^done)(NSDictionary *json, NSString *raw, NSError *err, BOOL lastTry)) {
-    NSArray *hosts = slHosts();
-    if (!hosts.count) {
-        if (done) done(nil, @"", nil, YES);
-        return;
-    }
-    NSURL *url = [NSURL URLWithString:[hosts[0] stringByAppendingString:path]];
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-    req.timeoutInterval = 10;
-    if ([method isEqualToString:@"POST"]) {
-        req.HTTPMethod = @"POST";
-        [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-        req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body ?: @{} options:0 error:nil];
-    }
-    if (headerName && headerValue) {
-        [req setValue:headerValue forHTTPHeaderField:headerName];
-    }
-    [req setValue:@"application/json" forHTTPHeaderField:@"Accept"];
-    [req setValue:@"ShanLianVPN/4.5.4 (iPhone; iOS 17.0)" forHTTPHeaderField:@"User-Agent"];
-
-    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
-    cfg.connectionProxyDictionary = @{};   // 直连
-    cfg.timeoutIntervalForRequest = 10;
-    cfg.timeoutIntervalForResource = 10;
-    NSURLSession *sess = [NSURLSession sessionWithConfiguration:cfg delegate:slSessionDelegateInstance() delegateQueue:nil];
-    [[sess dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-        [sess invalidateAndCancel];
-        if (err) {
-            if (done) done(nil, @"", err, YES);
-            return;
-        }
-        NSString *raw = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : @"";
-        NSDictionary *json = nil;
-        if (data.length) {
-            json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        }
-        if (done) done(json, raw, nil, YES);
-    }] resume];
-}
-
-static void slRequest(NSString *method, NSString *path, NSDictionary *body, NSString *token, void (^done)(NSDictionary *json, NSString *raw, NSError *err)) {
-    slRequestInternal(method, path, body, token, 0, ^(NSDictionary *json, NSString *raw, NSError *err, BOOL last) {
-        if (done) done(json, raw, err);
-    });
 }
 
 // 处理节点响应（成功路径）
@@ -366,47 +308,165 @@ static void slCollectNodes(id obj, NSMutableArray *uris, int depth) {
     }
 }
 
-#pragma mark - 主流程：读 token → 抓节点
+#pragma mark - 主流程：读 token → 抓节点（v3.6 多组合 + 自动注册）
 
-// 尝试多种鉴权头组合（服务端 401 = 鉴权格式不对，逐个试）
-static void slTryAuthVariants(NSString *token, NSString *path) {
-    NSArray *variants = @[
-        @{@"name": @"Bearer",  @"header": @"Authorization", @"value": [@"Bearer " stringByAppendingString:token]},
-        @{@"name": @"rawAuth", @"header": @"Authorization", @"value": token},
-        @{@"name": @"tokenH",  @"header": @"token",         @"value": token},
-        @{@"name": @"xToken",  @"header": @"x-token",       @"value": token},
-        @{@"name": @"accTok",  @"header": @"accessToken",   @"value": token},
-        @{@"name": @"xAccTok", @"header": @"x-access-token",@"value": token},
+// 带组合头的请求：headers 为字典数组 [{name,value},...]；多域名自动切换
+static void slRWHeadersAt(NSString *method, NSString *path, NSDictionary *body, NSArray *headers, int host, void (^done)(NSDictionary *json, NSString *raw, NSError *err)) {
+    NSArray *hosts = slHosts();
+    if (host >= (int)hosts.count) {
+        if (done) done(nil, @"", nil);
+        return;
+    }
+    NSURL *url = [NSURL URLWithString:[hosts[host] stringByAppendingString:path]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.timeoutInterval = 10;
+    if ([method isEqualToString:@"POST"]) {
+        req.HTTPMethod = @"POST";
+        [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+        req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body ?: @{} options:0 error:nil];
+    }
+    for (NSDictionary *h in headers) {
+        if (h[@"name"] && h[@"value"]) {
+            [req setValue:h[@"value"] forHTTPHeaderField:h[@"name"]];
+        }
+    }
+    [req setValue:@"application/json" forHTTPHeaderField:@"Accept"];
+    [req setValue:@"Dart/3.3 (dart:io)" forHTTPHeaderField:@"User-Agent"];
+
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
+    cfg.connectionProxyDictionary = @{};
+    cfg.timeoutIntervalForRequest = 10;
+    cfg.timeoutIntervalForResource = 10;
+    NSURLSession *sess = [NSURLSession sessionWithConfiguration:cfg delegate:slSessionDelegateInstance() delegateQueue:nil];
+    [[sess dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        [sess invalidateAndCancel];
+        if (err) {
+            slLog(@"  域名%@失败 err=%@，切备用", hosts[host], err.localizedDescription);
+            slRWHeadersAt(method, path, body, headers, host + 1, done);
+            return;
+        }
+        NSString *raw = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : @"";
+        NSDictionary *json = nil;
+        if (data.length) json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (done) done(json, raw, nil);
+    }] resume];
+}
+
+static void slRequestWithHeaders(NSString *method, NSString *path, NSDictionary *body, NSArray *headers, void (^done)(NSDictionary *json, NSString *raw, NSError *err)) {
+    slRWHeadersAt(method, path, body, headers, 0, done);
+}
+
+// 构造鉴权变体列表（v3.6：10 组，含设备签名/时间戳/deviceId 组合）
+static NSArray *slBuildAuthVariants(NSString *token) {
+    NSString *ts = slTimestamp();
+    NSString *dev = slDeviceId();
+    NSString *sign1 = slMD5([NSString stringWithFormat:@"%@%@", token, ts]);
+    NSString *sign2 = slMD5([NSString stringWithFormat:@"%@%@%@", token, dev, ts]);
+    return @[
+        @{@"name": @"Bearer",      @"headers": @[@{@"name": @"Authorization", @"value": [@"Bearer " stringByAppendingString:token]}]},
+        @{@"name": @"rawAuth",     @"headers": @[@{@"name": @"Authorization", @"value": token}]},
+        @{@"name": @"tokenH",      @"headers": @[@{@"name": @"token",         @"value": token}]},
+        @{@"name": @"xToken",      @"headers": @[@{@"name": @"x-token",       @"value": token}]},
+        @{@"name": @"accTok",      @"headers": @[@{@"name": @"accessToken",   @"value": token}]},
+        @{@"name": @"Bearer+aux",  @"headers": @[@{@"name": @"Authorization", @"value": [@"Bearer " stringByAppendingString:token]},
+                                                   @{@"name": @"X-Device-Id", @"value": dev},
+                                                   @{@"name": @"X-Timestamp", @"value": ts},
+                                                   @{@"name": @"X-Platform",   @"value": @"ios"},
+                                                   @{@"name": @"X-Version",    @"value": @"4.5.4"}]},
+        @{@"name": @"raw+ts+sign", @"headers": @[@{@"name": @"Authorization", @"value": token},
+                                                   @{@"name": @"X-Timestamp",  @"value": ts},
+                                                   @{@"name": @"X-Sign",       @"value": sign1}]},
+        @{@"name": @"token+dev+sign", @"headers": @[@{@"name": @"token",      @"value": token},
+                                                   @{@"name": @"deviceId",     @"value": dev},
+                                                   @{@"name": @"timestamp",    @"value": ts},
+                                                   @{@"name": @"sign",         @"value": sign2}]},
+        @{@"name": @"Bearer+dev+sign", @"headers": @[@{@"name": @"Authorization", @"value": [@"Bearer " stringByAppendingString:token]},
+                                                   @{@"name": @"deviceId",     @"value": dev},
+                                                   @{@"name": @"timestamp",    @"value": ts},
+                                                   @{@"name": @"sign",         @"value": sign2}]},
+        @{@"name": @"xToken+aux",  @"headers": @[@{@"name": @"x-token",       @"value": token},
+                                                   @{@"name": @"X-Device-Id",  @"value": dev},
+                                                   @{@"name": @"X-Timestamp",  @"value": ts}]},
     ];
+}
+
+static void slTryAuthVariants(NSString *token, NSString *path) {
+    NSArray *variants = slBuildAuthVariants(token);
     __block BOOL done = NO;
     for (NSDictionary *v in variants) {
         if (done) break;
-        NSString *hname = v[@"header"];
-        NSString *hval = v[@"value"];
-        slLog(@"尝试鉴权: %@ = %@...", hname, hval.length > 24 ? [hval substringToIndex:24] : hval);
-        slRequestWithHeader(@"GET", path, nil, hname, hval, ^(NSDictionary *json, NSString *raw, NSError *err, BOOL lastTry) {
+        NSString *name = v[@"name"];
+        NSArray *headers = v[@"headers"];
+        NSMutableString *hd = [NSMutableString string];
+        for (NSDictionary *h in headers) {
+            NSString *val = h[@"value"];
+            [hd appendFormat:@"%@=%@... ", h[@"name"], val.length > 20 ? [val substringToIndex:20] : val];
+        }
+        slLog(@"尝试鉴权[%@]: %@", name, hd);
+        slRequestWithHeaders(@"GET", path, nil, headers, ^(NSDictionary *json, NSString *raw, NSError *err) {
             if (err) {
-                slLog(@"  %@ 失败 err=%@", hname, err.localizedDescription);
+                slLog(@"  [%@] 失败 err=%@", name, err.localizedDescription);
                 return;
             }
-            BOOL ok = !([raw containsString:@"401"] || [raw containsString:@"无权限"] || [raw containsString:@"\"code\":401"]);
-            slLog(@"  %@ 响应: %@ -> %@", hname, raw.length > 120 ? [raw substringToIndex:120] : raw,
+            BOOL ok = !([raw containsString:@"401"] || [raw containsString:@"无权限"] || [raw containsString:@"\"code\":401"] || [raw containsString:@"\"code\":500"]);
+            slLog(@"  [%@] 响应: %@ -> %@", name, raw.length > 140 ? [raw substringToIndex:140] : raw,
                   ok ? @"可能成功" : @"仍失败");
-            if (ok && raw.length > 50) {
+            if (ok && raw.length > 30) {
                 done = YES;
-                slHandleNodesResponse(json, raw, [NSString stringWithFormat:@"鉴权头 %@", hname]);
+                slHandleNodesResponse(json, raw, [NSString stringWithFormat:@"鉴权[%@]", name]);
             }
         });
-        [NSThread sleepForTimeInterval:0.8];  // 间隔，避免触发风控
+        [NSThread sleepForTimeInterval:1.2];
     }
     if (!done) {
-        slLog(@"全部鉴权方式均失败，请抓包确认真实请求头");
-        slShowAlert(@"闪连助手", @"所有常见鉴权方式均返回 401\n请用 ProxyPin 抓一次「点连接」的包发给我");
+        slLog(@"鉴权组合全部失败，进入自动注册流程");
     }
 }
 
+// 游客注册：POST /app/tourist/slgenRandomUsergr，尝试取 token
+static void slTryTouristRegister(void (^done)(NSString *tokenOrNil)) {
+    NSString *dev = slDeviceId();
+    NSDictionary *body = @{@"deviceId": dev, @"platform": @"ios", @"version": @"4.5.4", @"versionCode": @"1"};
+    slLog(@"游客注册 slgenRandomUsergr...");
+    slRequestWithHeaders(@"POST", @"/app/tourist/slgenRandomUsergr", body, @[], ^(NSDictionary *json, NSString *raw, NSError *err) {
+        if (err) {
+            slLog(@"  注册失败 err=%@", err.localizedDescription);
+            if (done) done(nil);
+            return;
+        }
+        slLog(@"  注册响应: %@", raw.length > 300 ? [raw substringToIndex:300] : raw);
+        NSString *tok = nil;
+        if ([json isKindOfClass:[NSDictionary class]]) {
+            for (NSString *k in @[@"token", @"accessToken", @"access_token", @"userToken", @"data"]) {
+                id v = json[k];
+                if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 10) { tok = v; break; }
+                if ([v isKindOfClass:[NSDictionary class]]) {
+                    id t2 = ((NSDictionary *)v)[@"token"] ?: ((NSDictionary *)v)[@"accessToken"];
+                    if ([t2 isKindOfClass:[NSString class]] && [(NSString *)t2 length] > 10) { tok = t2; break; }
+                }
+            }
+        }
+        if (done) done(tok);
+    });
+}
+
+// 填邀请码：POST /app/customer/slfillInviteCodefe
+static void slTryFillInvite(NSString *token, void (^done)(BOOL ok)) {
+    NSString *dev = slDeviceId();
+    NSDictionary *body = @{@"inviteCode": @"88888888", @"deviceId": dev};
+    NSArray *headers = @[@{@"name": @"Authorization", @"value": [@"Bearer " stringByAppendingString:token]}];
+    slLog(@"填邀请码 88888888...");
+    slRequestWithHeaders(@"POST", @"/app/customer/slfillInviteCodefe", body, headers, ^(NSDictionary *json, NSString *raw, NSError *err) {
+        if (err) { slLog(@"  填码失败 err=%@", err.localizedDescription); if (done) done(NO); return; }
+        slLog(@"  填码响应: %@", raw.length > 300 ? [raw substringToIndex:300] : raw);
+        BOOL ok = !([raw containsString:@"401"] || [raw containsString:@"无权限"]);
+        if (done) done(ok);
+    });
+}
+
 static void slRunFlow(void) {
-    slLog(@"===== 闪连抓节点开始(读现有登录态) %@ =====", [NSDate date]);
+    slLog(@"===== 闪连抓节点 v3.6 开始 %@ =====", [NSDate date]);
+    slLog(@"deviceId=%@", slDeviceId());
 
     NSDictionary *found = slScanUserDefaults();
     slLog(@"UserDefaults 候选 key 数: %lu", (unsigned long)found.count);
@@ -420,13 +480,35 @@ static void slRunFlow(void) {
 
     NSString *token = slPickToken(found, keychain);
     if (!token.length) {
-        slLog(@"未找到任何 token，请确认 App 已登录");
-        slShowAlert(@"闪连助手", @"未找到登录 token\n请先在闪连VPN里登录一次再试");
+        slLog(@"未找到 token，走游客注册");
+        slTryTouristRegister(^(NSString *newToken) {
+            if (!newToken.length) {
+                slLog(@"游客注册未拿到 token");
+                slShowAlert(@"闪连助手", @"游客注册未返回 token\n请先手动登录一次，或把 sl_debug.txt 发我");
+                return;
+            }
+            slLog(@"游客注册拿到新 token len=%lu，尝试填邀请码+抓节点", (unsigned long)newToken.length);
+            slTryFillInvite(newToken, ^(BOOL ok) {
+                if (ok) slLog(@"邀请码填写成功");
+                else slLog(@"邀请码填写未确认（继续试节点）");
+                slTryAuthVariants(newToken, @"/app/customer/slgetNodesgs");
+                slShowAlert(@"闪连助手", @"自动流程已完成\n看 Documents/sl_debug.txt 结果");
+            });
+        });
         return;
     }
-    slLog(@"使用 token len=%lu", (unsigned long)token.length);
+    slLog(@"使用已有 token len=%lu", (unsigned long)token.length);
 
-    slTryAuthVariants(token, @"/app/customer/slgetNodes");
+    slTryAuthVariants(token, @"/app/customer/slgetNodesgs");
+    // 全失败后：试填邀请码再抓一次（可能 token 需要绑定邀请码才有权限）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+        slTryFillInvite(token, ^(BOOL ok) {
+            if (ok) slLog(@"邀请码填写成功，再抓一次节点");
+            slTryAuthVariants(token, @"/app/customer/slgetNodesgs");
+            slShowAlert(@"闪连助手", @"自动流程已完成\n看 Documents/sl_debug.txt 结果");
+        });
+    });
 }
 
 #pragma mark - 出站请求记录（看 App 真实怎么带鉴权）
