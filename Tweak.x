@@ -965,6 +965,88 @@ static void slHookLibboxSetup(void) {
     slLog(@"LibboxSetup hook installed");
 }
 
+// ============ v4.2: hook FlutterMethodChannel（Dart→原生 明文配置必经通道）============
+// v4.1 LibboxSetup 零调用 → 闪连配置不经过该 C 函数。Dart 解密后的节点配置最终必然
+// 通过 MethodChannel 发给原生层启动隧道 → hook setMethodCallHandler: 拦截配置 JSON 明文。
+static void (*orig_slSetHandler)(id, SEL, id);
+
+static void slDumpCall(id call, NSString *channel) {
+    @try {
+        if (!call) return;
+        NSString *method = [call valueForKey:@"method"];
+        if (!method.length) method = @"";
+        id args = [call valueForKey:@"arguments"];
+        NSString *s = nil;
+        if ([args isKindOfClass:[NSString class]]) {
+            s = args;
+        } else if ([args isKindOfClass:[NSDictionary class]] || [args isKindOfClass:[NSArray class]]) {
+            NSData *d = [NSJSONSerialization dataWithJSONObject:args options:0 error:nil];
+            if (d) s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+        } else if ([args isKindOfClass:[NSData class]]) {
+            s = [[NSString alloc] initWithData:args encoding:NSUTF8StringEncoding];
+        }
+        if (!s.length) {
+            slLog(@"[MCH] channel=%@ method=%@ args=%@", channel, method, args);
+            return;
+        }
+        NSString *low = [s lowercaseString];
+        NSString *mLow = [method lowercaseString];
+        BOOL hit = [mLow containsString:@"config"] || [mLow containsString:@"start"] ||
+                   [mLow containsString:@"tunnel"] || [mLow containsString:@"import"] ||
+                   [low containsString:@"outbounds"] || [low containsString:@"\"server\""] ||
+                   [low containsString:@"\"type\":\"vless\""] || [low containsString:@"\"type\":\"vmess\""] ||
+                   [low containsString:@"\"type\":\"trojan\""] || [low containsString:@"\"uuid\""];
+        if (hit) {
+            NSString *pp = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/sl_config.json"];
+            [s writeToFile:pp atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            slLog(@"[MCH] ★Dart→原生 配置捕获 (channel=%@ method=%@ len=%lu)", channel, method, (unsigned long)s.length);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                slShowAlert(@"节点配置已解密", [NSString stringWithFormat:@"channel=%@ method=%@ 已存 sl_config.json", channel, method]);
+            });
+            return;
+        }
+        slLog(@"[MCH] method=%@ args首200=%.200s", method, s.UTF8String);
+    } @catch (NSException *e) {
+        slLog(@"[MCH] dump 异常 %@", e);
+    }
+}
+
+static void slSetHandlerHook(id self, SEL _cmd, id handler) {
+    @try {
+        if (handler) {
+            NSString *chName = @"";
+            @try { chName = [self valueForKey:@"name"]; } @catch (NSException *e) {}
+            id origHandler = handler;
+            id wrapped = ^(id call, id result) {
+                @try {
+                    slDumpCall(call, chName);
+                } @catch (NSException *e) {}
+                if (origHandler) {
+                    void (^h)(id, id) = origHandler;
+                    h(call, result);
+                }
+            };
+            if (orig_slSetHandler) {
+                orig_slSetHandler(self, _cmd, wrapped);
+            }
+            return;
+        }
+    } @catch (NSException *e) {
+        slLog(@"[MCH] setHandlerHook 异常 %@", e);
+    }
+    if (orig_slSetHandler) orig_slSetHandler(self, _cmd, handler);
+}
+
+static void slHookMethodChannel(void) {
+    Class cls = NSClassFromString(@"FlutterMethodChannel");
+    if (!cls) { slLog(@"FlutterMethodChannel class not found"); return; }
+    Method m = class_getInstanceMethod(cls, NSSelectorFromString(@"setMethodCallHandler:"));
+    if (!m) { slLog(@"setMethodCallHandler: not found"); return; }
+    orig_slSetHandler = (void (*)(id, SEL, id))method_getImplementation(m);
+    method_setImplementation(m, (IMP)slSetHandlerHook);
+    slLog(@"FlutterMethodChannel handler hook installed");
+}
+
 static id (*orig_slDataTask)(id, SEL, NSURLRequest *, id);
 
 static id slDataTaskHook(id self, SEL _cmd, NSURLRequest *req, id completion) {
@@ -989,6 +1071,7 @@ __attribute__((constructor)) static void slInit(void) {
     slHookCCCrypt(); // v3.9: hook CCCrypt
     slHookCCCryptors(); // v4.0: hook CCCryptorCreateWithMode/Update/Final/GCM
     slHookLibboxSetup(); // v4.1: hook sing-box 配置入口（Go 层解密后的明文在此）
+    slHookMethodChannel(); // v4.2: hook FlutterMethodChannel（Dart→原生 明文配置必经通道）
     slHookOutbound();
     // v3.8: 停用自动伪造鉴权流程（旧 token 已失效 + 加密 data 无法伪造，徒增干扰），
     // 改为纯被动：App 自己点连接时拦截响应拿节点 JSON。
