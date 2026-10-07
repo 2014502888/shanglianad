@@ -5,7 +5,7 @@ export THEOS_PACKAGE_SCHEME = rootless
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = ShanLianAD
-ShanLianAD_FILES = Tweak.x
+ShanLianAD_FILES = Tweak.x fishhook.c
 ShanLianAD_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 ShanLianAD_LDFLAGS = -Wl,-undefined,dynamic_lookup
 

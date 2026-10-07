@@ -3,6 +3,8 @@
 #import <Security/Security.h>
 #import <objc/runtime.h>
 #import <CommonCrypto/CommonDigest.h>
+#import <CommonCrypto/CommonCryptor.h>
+#import "fishhook.h"
 
 // 前置声明（v3.6.1 修复）：slHandleNodesResponse 在 slURIFromDict/slCollectNodes 定义前调用，
 // C99 后隐式函数声明是编译错误，需 forward declaration
@@ -640,6 +642,67 @@ static void slLogRequest(NSURLRequest *req, NSData *bodyData) {
 - (void)stopLoading {}
 @end
 
+// v3.9: hook CCCrypt（CommonCrypto AES）——App 在原生层解密节点时 dump key/iv/明文。
+// 背景：sl_nodes_raw.json 的 data 是 AES 密文（16 对齐、随机字节），盲试密钥无意义；
+// 若 App 用 CommonCrypto 解密，CCCrypt 的 outData 就是节点明文 JSON，直接截获。
+static CCCryptorStatus (*orig_CCCrypt)(CCOperation op, CCAlgorithm alg, CCOptions options,
+    const void *key, size_t keyLength, const void *iv,
+    const void *dataIn, size_t dataInLength, void *dataOut, size_t dataOutAvailable,
+    size_t *dataOutMoved);
+
+static CCCryptorStatus my_CCCrypt(CCOperation op, CCAlgorithm alg, CCOptions options,
+    const void *key, size_t keyLength, const void *iv,
+    const void *dataIn, size_t dataInLength, void *dataOut, size_t dataOutAvailable,
+    size_t *dataOutMoved) {
+    CCCryptorStatus st = orig_CCCrypt(op, alg, options, key, keyLength, iv, dataIn, dataInLength, dataOut, dataOutAvailable, dataOutMoved);
+    @try {
+        if (alg != kCCAlgorithmAES) return st;
+        size_t outLen = (dataOutMoved && st == kCCSuccess) ? *dataOutMoved : 0;
+        NSMutableString *kh = [NSMutableString string];
+        for (size_t i = 0; i < keyLength; i++) [kh appendFormat:@"%02x", ((const unsigned char*)key)[i]];
+        NSString *ivh = @"-";
+        if (iv) {
+            NSMutableString *t = [NSMutableString string];
+            for (int i = 0; i < 16; i++) [t appendFormat:@"%02x", ((const unsigned char*)iv)[i]];
+            ivh = t;
+        }
+        if (op == kCCEncrypt) {
+            if (dataInLength > 100) slLog(@"[CCCrypt] ENC alg=%d keyLen=%zu in=%zu key=%@ iv=%@", (int)alg, keyLength, dataInLength, kh, ivh);
+            return st;
+        }
+        // DEC
+        slLog(@"[CCCrypt] DEC alg=%d keyLen=%zu in=%zu out=%zu key=%@ iv=%@", (int)alg, keyLength, dataInLength, outLen, kh, ivh);
+        if (outLen > 0) {
+            NSString *s = [[NSString alloc] initWithBytes:dataOut length:outLen encoding:NSUTF8StringEncoding];
+            if (s) {
+                if (outLen > 50) slLog(@"[CCCrypt] DEC text(%.200s)", s.UTF8String);
+                if ([s containsString:@"vmess"] || [s containsString:@"\"host\""] || [s containsString:@"\"port\""] ||
+                    [s containsString:@"ss://"] || [s containsString:@"trojan"] || [s containsString:@"ws://"]) {
+                    NSString *pp = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/sl_nodes_plain.json"];
+                    [s writeToFile:pp atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                    slLog(@"[CCCrypt] ★节点明文已保存 -> sl_nodes_plain.json");
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        slShowAlert(@"节点明文已解密", @"已保存到 sl_nodes_plain.json，可直接转订阅");
+                    });
+                }
+            } else {
+                slLog(@"[CCCrypt] DEC binary out=%zu first=%@", outLen,
+                      [[NSData dataWithBytes:dataOut length:MIN(outLen,16)] base64EncodedStringWithOptions:0]);
+            }
+        }
+    } @catch (NSException *e) {
+        slLog(@"[CCCrypt] hook 异常 %@", e);
+    }
+    return st;
+}
+
+static void slHookCCCrypt(void) {
+    rebind_symbols((struct rebinding[]){
+        {"CCCrypt", (void*)my_CCCrypt, (void**)&orig_CCCrypt}
+    }, 1);
+    slLog(@"CCCrypt hooked");
+}
+
 static id (*orig_slDataTask)(id, SEL, NSURLRequest *, id);
 
 static id slDataTaskHook(id self, SEL _cmd, NSURLRequest *req, id completion) {
@@ -661,6 +724,7 @@ static void slHookOutbound(void) {
 }
 
 __attribute__((constructor)) static void slInit(void) {
+    slHookCCCrypt(); // v3.9: 先 hook 解密（App 原生层解密节点时截明文）
     slHookOutbound();
     // v3.8: 停用自动伪造鉴权流程（旧 token 已失效 + 加密 data 无法伪造，徒增干扰），
     // 改为纯被动：App 自己点连接时拦截响应拿节点 JSON。
