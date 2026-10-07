@@ -4,6 +4,8 @@
 #import <objc/runtime.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <CommonCrypto/CommonCryptor.h>
+#import <dlfcn.h>
+#import <mach/mach.h>
 #import "fishhook.h"
 
 // 前置声明（v3.6.1 修复）：slHandleNodesResponse 在 slURIFromDict/slCollectNodes 定义前调用，
@@ -860,6 +862,109 @@ static void slHookCCCryptors(void) {
     slLog(@"CCCryptor hooks installed (CreateWithMode/Update/Final/GCM)");
 }
 
+// ============ v4.1: hook LibboxSetup（sing-box Go 内核配置入口）============
+// 背景：v4.0 的 CCCryptor 系列 hook 仍零命中 → App 解密在 Go 层（sing-box 静态链接，
+// crypto/aes 纯 Go/BoringSSL 实现，完全绕过 CommonCrypto）。但节点解密后最终会
+// 转成 sing-box 配置传给 LibboxSetup 启动内核 → options 里必有明文节点配置。
+typedef kern_return_t (*sl_mach_vm_read_t)(vm_map_t, mach_vm_address_t, mach_vm_size_t, vm_offset_t *, mach_msg_type_number_t *);
+
+static kern_return_t slMachVmRead(vm_map_t task, mach_vm_address_t addr, mach_vm_size_t size,
+                                  vm_offset_t *data, mach_msg_type_number_t *cnt) {
+    static sl_mach_vm_read_t fn = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fn = (sl_mach_vm_read_t)dlsym(RTLD_DEFAULT, "mach_vm_read");
+    });
+    if (!fn) return KERN_FAILURE;
+    return fn(task, addr, size, data, cnt);
+}
+
+static BOOL slLooksLikeConfigString(NSString *s) {
+    if (s.length < 80) return NO;
+    NSString *low = [s lowercaseString];
+    return [low containsString:@"outbounds"] ||
+           ([low containsString:@"\"uuid\""] && [low containsString:@"server_port"]) ||
+           [low containsString:@"\"type\":\"vless\""] ||
+           [low containsString:@"\"type\":\"vmess\""] ||
+           [low containsString:@"\"type\":\"trojan\""] ||
+           [low containsString:@"\"type\":\"shadowsocks\""] ||
+           ([low containsString:@"\"server\""] && [low containsString:@"\"tag\""] &&
+            [low containsString:@"\"port\""]);
+}
+
+static void slHandleConfig(NSString *configJson, NSString *source) {
+    if (!configJson.length) return;
+    NSString *pp = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/sl_config.json"];
+    [configJson writeToFile:pp atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    slLog(@"[LIBBOX] ★已保存 sing-box 配置（%s）len=%lu -> sl_config.json",
+          source.UTF8String, (unsigned long)[configJson lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        slShowAlert(@"节点配置已解密", [NSString stringWithFormat:@"已保存 %lu 字节到 sl_config.json（可直接转订阅）",
+                    (unsigned long)[configJson lengthOfBytesUsingEncoding:NSUTF8StringEncoding]]);
+    });
+}
+
+// Go string = {char* ptr; int64 len;} —— 从结构体偏移处读指针+长度，再安全读内存
+static void slTryReadGoString(const unsigned char *mem, long offset) {
+    unsigned long long ptr = 0;
+    unsigned long long len = 0;
+    memcpy(&ptr, mem + offset, 8);
+    memcpy(&len, mem + offset + 8, 8);
+    if (ptr < 0x10000 || len == 0 || len > 0x100000) return;
+    if (ptr > 0x7fffffffffffULL) return;
+    vm_offset_t data = 0;
+    mach_msg_type_number_t cnt = 0;
+    kern_return_t kr = slMachVmRead(mach_task_self(), (mach_vm_address_t)ptr, (mach_msg_type_number_t)len, &data, &cnt);
+    if (kr != KERN_SUCCESS || cnt == 0) return;
+    int printable = 1;
+    for (unsigned long long i = 0; i < cnt; i++) {
+        unsigned char c = ((unsigned char *)data)[i];
+        if (c < 0x09 || (c > 0x0D && c < 0x20)) { printable = 0; break; }
+    }
+    if (printable && cnt >= 4) {
+        NSString *s = [[NSString alloc] initWithBytes:(const void *)data length:cnt encoding:NSUTF8StringEncoding];
+        if (s.length) {
+            slLog(@"[LIBBOX] string[off=%ld len=%u]: %.300s", offset, cnt, s.UTF8String);
+            if (slLooksLikeConfigString(s)) {
+                slHandleConfig(s, @"LibboxSetup options");
+            }
+        }
+    }
+    vm_deallocate(mach_task_self(), data, cnt);
+}
+
+static int (*orig_slLibboxSetup)(void *options);
+
+static int sl_LibboxSetup(void *options) {
+    slLog(@">>> LibboxSetup called, options=%p", options);
+    if (options) {
+        const unsigned char *mem = (const unsigned char *)options;
+        for (long off = 0; off < 1024 - 16; off += 8) {
+            @try {
+                slTryReadGoString(mem, off);
+            } @catch (NSException *e) {}
+        }
+        // 前 256 字节 hex dump（诊断用）
+        NSMutableString *hex = [NSMutableString string];
+        for (int i = 0; i < 256; i++) {
+            [hex appendFormat:@"%02X ", mem[i]];
+            if (i % 16 == 15) [hex appendString:@"\n"];
+        }
+        slLog(@"LibboxSetup options hex:\n%@", hex);
+    }
+    if (orig_slLibboxSetup) {
+        return orig_slLibboxSetup(options);
+    }
+    return 0;
+}
+
+static void slHookLibboxSetup(void) {
+    rebind_symbols((struct rebinding[]){
+        {"LibboxSetup", (void *)sl_LibboxSetup, (void **)&orig_slLibboxSetup}
+    }, 1);
+    slLog(@"LibboxSetup hook installed");
+}
+
 static id (*orig_slDataTask)(id, SEL, NSURLRequest *, id);
 
 static id slDataTaskHook(id self, SEL _cmd, NSURLRequest *req, id completion) {
@@ -882,7 +987,8 @@ static void slHookOutbound(void) {
 
 __attribute__((constructor)) static void slInit(void) {
     slHookCCCrypt(); // v3.9: hook CCCrypt
-    slHookCCCryptors(); // v4.0: hook CCCryptorCreateWithMode/Update/Final/GCM（GCM 真正入口）
+    slHookCCCryptors(); // v4.0: hook CCCryptorCreateWithMode/Update/Final/GCM
+    slHookLibboxSetup(); // v4.1: hook sing-box 配置入口（Go 层解密后的明文在此）
     slHookOutbound();
     // v3.8: 停用自动伪造鉴权流程（旧 token 已失效 + 加密 data 无法伪造，徒增干扰），
     // 改为纯被动：App 自己点连接时拦截响应拿节点 JSON。
