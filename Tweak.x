@@ -17,11 +17,24 @@ static void slCollectNodes(id obj, NSMutableArray *uris, int depth);
 //   - 鉴权疑似 token + deviceSig(设备签名) + encryptUid，v3.5 只试 6 种裸 token 头故全 401。
 //   - 新增自动流程：无 token → 游客注册拿 token → 填邀请码 88888888 → 再抓节点。
 //   - 路径带后缀 + 组合头逐个实测，全程写 sl_debug.txt。
+// v3.7 变更（依据用户装测 sl_debug.txt 出站记录）：
+//   - App 真实 UA = "Shan Lian" + 自定义头 shanlian:1（之前自造 UA 触发 SSL 失败/风控）。
+//   - 真实域名 10 个（日志抓到的 getIw 轮询域名），补全 slHosts。
+//   - App 真实 deviceId 存钥匙串 kShanLianDeviceIdKey（36位），优先读取替代自造 UUID。
+//   - 出站记录器 URL 过滤改大小写不敏感 + 补 slgetNodes/getNodes 关键词
+//     （之前漏掉节点请求，导致"点连接"的真实鉴权头没被记录）。
 
 static NSArray *slHosts(void) {
     return @[@"https://api.aslafvbn.shop",
              @"https://api.qinghuapf.cn",
-             @"https://api.sladoc.com"];
+             @"https://api.slacover.com",
+             @"https://api.intlcg.com",
+             @"https://api.slcloudstore.com",
+             @"https://api.slapower.com",
+             @"https://api.intljp.com",
+             @"https://api.sladoc.com",
+             @"https://api.intldllc.com",
+             @"https://api.slaclouds.com"];
 }
 
 static void slLog(NSString *fmt, ...) {
@@ -66,10 +79,25 @@ static NSString *slMD5(NSString *s) {
     return out;
 }
 
-// 固定设备 ID（首次运行生成并持久化，保证签名/注册一致性）
+// 固定设备 ID：优先读 App 钥匙串 kShanLianDeviceIdKey（真实 deviceId），
+// 读不到才自造并持久化（保证签名/注册与 App 一致）
 static NSString *slDeviceId(void) {
     NSString *k = @"sl_dylib_device_id";
     NSString *v = [[NSUserDefaults standardUserDefaults] stringForKey:k];
+    // 尝试从钥匙串读 App 真实 deviceId
+    NSMutableDictionary *query = [NSMutableDictionary dictionary];
+    query[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
+    query[(__bridge id)kSecAttrService] = @"flutter_secure_storage_service";
+    query[(__bridge id)kSecAttrAccount] = @"kShanLianDeviceIdKey";
+    query[(__bridge id)kSecReturnData] = @YES;
+    CFDataRef outData = NULL;
+    OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)query, (CFTypeRef *)&outData);
+    if (st == errSecSuccess && outData) {
+        NSString *kv = [[NSString alloc] initWithData:(__bridge_transfer NSData *)outData encoding:NSUTF8StringEncoding];
+        if (kv.length == 36) {
+            return kv;
+        }
+    }
     if (!v.length) {
         v = [[[NSUUID UUID] UUIDString] lowercaseString];
         [[NSUserDefaults standardUserDefaults] setObject:v forKey:k];
@@ -336,7 +364,9 @@ static void slRWHeadersAt(NSString *method, NSString *path, NSDictionary *body, 
         }
     }
     [req setValue:@"application/json" forHTTPHeaderField:@"Accept"];
-    [req setValue:@"Dart/3.3 (dart:io)" forHTTPHeaderField:@"User-Agent"];
+    // v3.7: 与 App 真实请求一致（日志实测 UA=Shan Lian + shanlian:1），避免风控/SSL 拒绝
+    [req setValue:@"Shan Lian" forHTTPHeaderField:@"User-Agent"];
+    [req setValue:@"1" forHTTPHeaderField:@"shanlian"];
 
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
     cfg.connectionProxyDictionary = @{};
@@ -421,7 +451,7 @@ static void slTryAuthVariants(NSString *token, NSString *path) {
                 slHandleNodesResponse(json, raw, [NSString stringWithFormat:@"鉴权[%@]", name]);
             }
         });
-        [NSThread sleepForTimeInterval:1.2];
+        [NSThread sleepForTimeInterval:1.5];
     }
     if (!done) {
         slLog(@"鉴权组合全部失败，进入自动注册流程");
@@ -524,14 +554,18 @@ static void slRunFlow(void) {
 static void slLogRequest(NSURLRequest *req, NSData *bodyData) {
     if (!req.URL) return;
     NSString *u = req.URL.absoluteString;
-    // 只记 API 类请求，过滤图片/统计
-    if ([u containsString:@"aslafvbn"] || [u containsString:@"slaclouds"] ||
-        [u containsString:@"slacover"] || [u containsString:@"slapower"] ||
-        [u containsString:@"slcloudstore"] || [u containsString:@"sladoc"] ||
-        [u containsString:@"surfonline"] || [u containsString:@"shanlian"] ||
-        [u containsString:@"nodes"] || [u containsString:@"register"] ||
-        [u containsString:@"login"] || [u containsString:@"invite"] ||
-        [u containsString:@"user"] || [u containsString:@"token"]) {
+    NSString *low = [u lowercaseString];
+    // v3.7: 大小写不敏感匹配 + 补 slgetNodes/getNodes 关键词（之前漏记节点请求）
+    if ([low containsString:@"aslafvbn"] || [low containsString:@"slaclouds"] ||
+        [low containsString:@"slacover"] || [low containsString:@"slapower"] ||
+        [low containsString:@"slcloudstore"] || [low containsString:@"sladoc"] ||
+        [low containsString:@"surfonline"] || [low containsString:@"shanlian"] ||
+        [low containsString:@"slgetnodes"] || [low containsString:@"getnodes"] ||
+        [low containsString:@"nodes"] || [low containsString:@"register"] ||
+        [low containsString:@"login"] || [low containsString:@"invite"] ||
+        [low containsString:@"user"] || [low containsString:@"token"] ||
+        [low containsString:@"intlcg"] || [low containsString:@"intljp"] ||
+        [low containsString:@"intldllc"] || [low containsString:@"qinghuapf"]) {
         NSMutableString *ms = [NSMutableString string];
         [ms appendFormat:@"\n>>> OUT %@ %@", req.HTTPMethod ?: @"GET", u];
         for (NSString *k in req.allHTTPHeaderFields) {
