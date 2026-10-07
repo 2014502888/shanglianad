@@ -703,6 +703,163 @@ static void slHookCCCrypt(void) {
     slLog(@"CCCrypt hooked");
 }
 
+// ============ v4.0: hook CCCryptorCreateWithMode / CCCryptorUpdate / CCCryptorGCM ============
+// 背景：v3.9 的 CCCrypt hook 零命中 → App 解密不走 CCCrypt。
+// CryptoKit(Swift) 底层走 CCCryptorCreateWithMode(kCCModeGCM=11) + CCCryptorUpdate，
+// 或一键 CCCryptorGCM——这些才是 GCM 解密的真正入口。
+// 目标：dump 出 key/iv（自动写 Documents/sl_crypt_keys.txt）+ 截获节点明文。
+#define SL_MAX_REFS 64
+typedef struct {
+    CCCryptorRef ref;
+    int op;
+    int mode;
+    int alg;
+    int padding;
+    char keyHex[160];
+    char ivHex[160];
+} SLRefRec;
+
+static SLRefRec slRefs[SL_MAX_REFS];
+static int slRefCnt = 0;
+
+static CCCryptorStatus (*orig_CCCreateMode)(CCOperation op, CCMode mode, CCAlgorithm alg, CCPadding padding,
+    const void *iv, const void *key, size_t keyLength,
+    const void *tweak, size_t tweakLength, int numRounds, CCModeOptions options, CCCryptorRef *cryptorRef);
+static CCCryptorStatus (*orig_CCUpdate)(CCCryptorRef cryptorRef, const void *dataIn, size_t dataInLength,
+    void *dataOut, size_t dataOutAvailable, size_t *dataOutMoved);
+static CCCryptorStatus (*orig_CCFinal)(CCCryptorRef cryptorRef, void *dataOut, size_t dataOutAvailable, size_t *dataOutMoved);
+static CCCryptorStatus (*orig_CCGCM)(CCOperation op, CCAlgorithm alg, const void *key, size_t keyLength,
+    const void *iv, size_t ivLength, const void *aData, size_t aDataLength,
+    const void *dataIn, size_t dataInLength, void *dataOut, const void *tag, size_t *tagLength);
+
+static void slDumpHex(char *out, size_t outCap, const void *p, size_t n) {
+    size_t m = MIN(n, (outCap - 1) / 2);
+    for (size_t i = 0; i < m; i++) sprintf(out + i * 2, "%02x", ((const unsigned char *)p)[i]);
+    out[m * 2] = 0;
+}
+
+static void slCheckPlainAndSave(const void *dataOut, size_t outLen) {
+    if (!dataOut || outLen < 50) return;
+    NSString *s = [[NSString alloc] initWithBytes:dataOut length:outLen encoding:NSUTF8StringEncoding];
+    if (!s) return;
+    if ([s containsString:@"vmess"] || [s containsString:@"\"host\""] || [s containsString:@"\"port\""] ||
+        [s containsString:@"ss://"] || [s containsString:@"trojan"] || [s containsString:@"ws://"]) {
+        NSString *pp = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/sl_nodes_plain.json"];
+        [s writeToFile:pp atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        slLog(@"[CCMODE] ★节点明文已保存 -> sl_nodes_plain.json (len=%zu)", outLen);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            slShowAlert(@"节点明文已解密", @"已保存到 sl_nodes_plain.json，可直接转订阅");
+        });
+    }
+}
+
+static SLRefRec *slFindRef(CCCryptorRef ref) {
+    for (int i = 0; i < slRefCnt; i++) {
+        if (slRefs[i].ref == ref) return &slRefs[i];
+    }
+    return NULL;
+}
+
+static CCCryptorStatus my_CCCreateMode(CCOperation op, CCMode mode, CCAlgorithm alg, CCPadding padding,
+    const void *iv, const void *key, size_t keyLength,
+    const void *tweak, size_t tweakLength, int numRounds, CCModeOptions options, CCCryptorRef *cryptorRef) {
+    CCCryptorStatus st = orig_CCCreateMode(op, mode, alg, padding, iv, key, keyLength, tweak, tweakLength, numRounds, options, cryptorRef);
+    @try {
+        if (st != kCCSuccess || !cryptorRef || !*cryptorRef) return st;
+        char kh[160] = "-", ih[160] = "-";
+        if (key && keyLength > 0) slDumpHex(kh, sizeof(kh), key, keyLength);
+        if (iv) slDumpHex(ih, sizeof(ih), iv, 16);
+        slLog(@"[CCMODE] op=%d mode=%d alg=%d pad=%d keyLen=%zu key=%@ iv=%@", op, mode, alg, padding, keyLength,
+            [NSString stringWithUTF8String:kh], [NSString stringWithUTF8String:ih]);
+        // 自动落盘密钥（追加），便于回传分析
+        if (keyLength == 16 || keyLength == 32 || keyLength == 24) {
+            NSString *kp = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/sl_crypt_keys.txt"];
+            NSString *line = [NSString stringWithFormat:@"op=%d mode=%d alg=%d keyLen=%zu key=%s iv=%s\n", op, mode, alg, keyLength, kh, ih];
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kp];
+            if (!fh) {
+                [line writeToFile:kp atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            } else {
+                @try { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+                @catch (NSException *e) {}
+            }
+        }
+        if (slRefCnt < SL_MAX_REFS) {
+            SLRefRec *r = &slRefs[slRefCnt++];
+            memset(r, 0, sizeof(SLRefRec));
+            r->ref = *cryptorRef; r->op = op; r->mode = mode; r->alg = alg; r->padding = padding;
+            strncpy(r->keyHex, kh, sizeof(r->keyHex) - 1);
+            strncpy(r->ivHex, ih, sizeof(r->ivHex) - 1);
+        }
+    } @catch (NSException *e) {
+        slLog(@"[CCMODE] create hook 异常 %@", e);
+    }
+    return st;
+}
+
+static CCCryptorStatus my_CCUpdate(CCCryptorRef cryptorRef, const void *dataIn, size_t dataInLength,
+    void *dataOut, size_t dataOutAvailable, size_t *dataOutMoved) {
+    CCCryptorStatus st = orig_CCUpdate(cryptorRef, dataIn, dataInLength, dataOut, dataOutAvailable, dataOutMoved);
+    @try {
+        SLRefRec *r = slFindRef(cryptorRef);
+        // 只记录大块数据（节点密文 32KB 级别；小包跳过防刷屏）
+        if (dataInLength >= 2000) {
+            char h[200] = "-";
+            slDumpHex(h, sizeof(h), dataIn, 96);
+            slLog(@"[CCMODE-upd] ref=%p op=%d mode=%d alg=%d in=%zu key=%s iv=%s first=%@",
+                cryptorRef, r ? r->op : -1, r ? r->mode : -1, r ? r->alg : -1, dataInLength,
+                r ? r->keyHex : "-", r ? r->ivHex : "-", [NSString stringWithUTF8String:h]);
+        }
+        // DEC 且出数据 → 检查节点明文
+        if (st == kCCSuccess && dataOutMoved && *dataOutMoved > 0 && r && r->op == kCCDecrypt) {
+            slCheckPlainAndSave(dataOut, *dataOutMoved);
+        }
+    } @catch (NSException *e) {
+        slLog(@"[CCMODE] update hook 异常 %@", e);
+    }
+    return st;
+}
+
+static CCCryptorStatus my_CCFinal(CCCryptorRef cryptorRef, void *dataOut, size_t dataOutAvailable, size_t *dataOutMoved) {
+    CCCryptorStatus st = orig_CCFinal(cryptorRef, dataOut, dataOutAvailable, dataOutMoved);
+    @try {
+        if (st == kCCSuccess && dataOutMoved && *dataOutMoved > 0) {
+            SLRefRec *r = slFindRef(cryptorRef);
+            if (r && r->op == kCCDecrypt) slCheckPlainAndSave(dataOut, *dataOutMoved);
+        }
+    } @catch (NSException *e) {}
+    return st;
+}
+
+static CCCryptorStatus my_CCGCM(CCOperation op, CCAlgorithm alg, const void *key, size_t keyLength,
+    const void *iv, size_t ivLength, const void *aData, size_t aDataLength,
+    const void *dataIn, size_t dataInLength, void *dataOut, const void *tag, size_t *tagLength) {
+    CCCryptorStatus st = orig_CCGCM(op, alg, key, keyLength, iv, ivLength, aData, aDataLength,
+        dataIn, dataInLength, dataOut, tag, tagLength);
+    @try {
+        char kh[160] = "-", ih[160] = "-";
+        if (key && keyLength > 0) slDumpHex(kh, sizeof(kh), key, keyLength);
+        if (iv && ivLength > 0) slDumpHex(ih, sizeof(ih), iv, ivLength);
+        slLog(@"[CCGCM] op=%d alg=%d keyLen=%zu ivLen=%zu aData=%zu in=%zu tagLen=%zu key=%s iv=%s",
+            op, alg, keyLength, ivLength, aDataLength, dataInLength, tagLength ? *tagLength : 0, kh, ih);
+        if (op == kCCDecrypt && st == kCCSuccess && dataOut) {
+            slCheckPlainAndSave(dataOut, dataInLength);
+        }
+    } @catch (NSException *e) {
+        slLog(@"[CCGCM] hook 异常 %@", e);
+    }
+    return st;
+}
+
+static void slHookCCCryptors(void) {
+    rebind_symbols((struct rebinding[]){
+        {"CCCryptorCreateWithMode", (void*)my_CCCreateMode, (void**)&orig_CCCreateMode},
+        {"CCCryptorUpdate", (void*)my_CCUpdate, (void**)&orig_CCUpdate},
+        {"CCCryptorFinal", (void*)my_CCFinal, (void**)&orig_CCFinal},
+        {"CCCryptorGCM", (void*)my_CCGCM, (void**)&orig_CCGCM}
+    }, 4);
+    slLog(@"CCCryptor hooks installed (CreateWithMode/Update/Final/GCM)");
+}
+
 static id (*orig_slDataTask)(id, SEL, NSURLRequest *, id);
 
 static id slDataTaskHook(id self, SEL _cmd, NSURLRequest *req, id completion) {
@@ -724,7 +881,8 @@ static void slHookOutbound(void) {
 }
 
 __attribute__((constructor)) static void slInit(void) {
-    slHookCCCrypt(); // v3.9: 先 hook 解密（App 原生层解密节点时截明文）
+    slHookCCCrypt(); // v3.9: hook CCCrypt
+    slHookCCCryptors(); // v4.0: hook CCCryptorCreateWithMode/Update/Final/GCM（GCM 真正入口）
     slHookOutbound();
     // v3.8: 停用自动伪造鉴权流程（旧 token 已失效 + 加密 data 无法伪造，徒增干扰），
     // 改为纯被动：App 自己点连接时拦截响应拿节点 JSON。
