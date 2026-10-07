@@ -590,6 +590,54 @@ static void slLogRequest(NSURLRequest *req, NSData *bodyData) {
 - (void)stopLoading {}
 @end
 
+// v3.8: 响应拦截转发——App 自己请求 slgetNodesgs 时（已带合法 JWT），
+// 我们截住转发并保存响应（节点 JSON），100% 拿到真实节点数据。
+@interface SLRespProtocol : NSURLProtocol
+@end
+
+@implementation SLRespProtocol
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    if ([NSURLProtocol propertyForKey:@"SLRESP_SKIP" inRequest:request]) return NO; // 防循环
+    NSString *u = [request.URL.absoluteString lowercaseString];
+    if ([u containsString:@"slgetnodes"] || [u containsString:@"getnodes"]) {
+        return YES;
+    }
+    return NO;
+}
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
+- (void)startLoading {
+    NSMutableURLRequest *r = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"SLRESP_SKIP" inRequest:r];
+    NSURLSession *s = [NSURLSession sessionWithConfiguration:[NSURLSessionConfiguration defaultSessionConfiguration]];
+    [[s dataTaskWithRequest:r completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        [s invalidateAndCancel];
+        if (!err && data.length) {
+            // 保存节点响应（原始 JSON）
+            NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/sl_nodes_raw.json"];
+            [data writeToFile:path atomically:YES];
+            NSString *head = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (head.length > 600) head = [head substringToIndex:600];
+            slLog(@"[SLRESP] 节点响应已保存 %lu 字节 -> sl_nodes_raw.json\n%@", (unsigned long)data.length, head);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                slShowAlert(@"节点响应已抓取", [NSString stringWithFormat:@"已保存 %lu 字节到 sl_nodes_raw.json", (unsigned long)data.length]);
+            });
+        } else if (err) {
+            slLog(@"[SLRESP] 节点响应失败 err=%@", err.localizedDescription);
+        }
+        // 转发给原始请求方（不能影响 App 自身功能）
+        if (!err) {
+            NSHTTPURLResponse *hr = (NSHTTPURLResponse *)resp;
+            [self.client URLProtocol:self didReceiveResponse:hr cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+            [self.client URLProtocol:self didLoadData:data];
+            [self.client URLProtocolDidFinishLoading:self];
+        } else {
+            [self.client URLProtocol:self didFailWithError:err];
+        }
+    }] resume];
+}
+- (void)stopLoading {}
+@end
+
 static id (*orig_slDataTask)(id, SEL, NSURLRequest *, id);
 
 static id slDataTaskHook(id self, SEL _cmd, NSURLRequest *req, id completion) {
@@ -601,6 +649,7 @@ static id slDataTaskHook(id self, SEL _cmd, NSURLRequest *req, id completion) {
 
 static void slHookOutbound(void) {
     [NSURLProtocol registerClass:[SLReqProtocol class]];
+    [NSURLProtocol registerClass:[SLRespProtocol class]]; // v3.8: 拦截节点响应
     Method md = class_getInstanceMethod([NSURLSession class], @selector(dataTaskWithRequest:completionHandler:));
     if (md) {
         orig_slDataTask = (void *)method_getImplementation(md);
@@ -611,8 +660,8 @@ static void slHookOutbound(void) {
 
 __attribute__((constructor)) static void slInit(void) {
     slHookOutbound();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
-                       slRunFlow();
-                   });
+    // v3.8: 停用自动伪造鉴权流程（旧 token 已失效 + 加密 data 无法伪造，徒增干扰），
+    // 改为纯被动：App 自己点连接时拦截响应拿节点 JSON。
+    // 需要恢复主动抓取时再启用 slRunFlow。
+    // dispatch_after(..., slRunFlow);
 }
