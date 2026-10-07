@@ -4,6 +4,11 @@
 #import <objc/runtime.h>
 #import <CommonCrypto/CommonDigest.h>
 
+// 前置声明（v3.6.1 修复）：slHandleNodesResponse 在 slURIFromDict/slCollectNodes 定义前调用，
+// C99 后隐式函数声明是编译错误，需 forward declaration
+static NSString *slURIFromDict(NSDictionary *d);
+static void slCollectNodes(id obj, NSMutableArray *uris, int depth);
+
 // ===== ShanLianAD v3.6: 真实接口(带后缀) + 设备签名鉴权组合 + 自动游客注册/邀请码 =====
 // v3.6 变更（依据 App AOT 逆向）：
 //   - 真实接口名带混淆后缀（服务器剥后缀路由）：节点 = /app/customer/slgetNodesgs，
